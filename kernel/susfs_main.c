@@ -13,6 +13,7 @@
 #include <linux/security.h>	/* security_secctx_to_secid(): the nodes' SELinux label */
 
 #include "symbol_resolver.h"
+#include "drm_guard.h"		/* Widevine deviceUniqueId dry-run probe */
 #include "ksu_allow_gate.h"	/* susfs_ksu_allow_kind: whether ksu_file applies at all */
 #include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
 #include "susfs_log.h"
@@ -270,6 +271,11 @@ static struct {
     { "avc_spoof",	susfs_avc_spoof_init,		susfs_avc_spoof_exit,	false, false },
     { "supercall",	susfs_supercall_init,		susfs_supercall_exit,	true,  false },
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, false },
+    /* Observation only (M1): a kretprobe on binder_ioctl that counts DRM
+     * getPropertyByteArray("deviceUniqueId") round trips and writes no byte.
+     * NOT fatal: on a kernel whose binder entry cannot be probed the module
+     * still loads, this feature simply stays off. */
+    { "drm_guard",	drm_guard_init,			drm_guard_exit,		false, false },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
