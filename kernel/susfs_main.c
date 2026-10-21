@@ -14,6 +14,7 @@
 
 #include "symbol_resolver.h"
 #include "drm_guard.h"		/* Widevine deviceUniqueId dry-run probe */
+#include "taint_spoof.h"	/* get_taint -> 0, what the shipped ko also does */
 #include "ksu_allow_gate.h"	/* susfs_ksu_allow_kind: whether ksu_file applies at all */
 #include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
 #include "susfs_log.h"
@@ -276,6 +277,9 @@ static struct {
      * NOT fatal: on a kernel whose binder entry cannot be probed the module
      * still loads, this feature simply stays off. */
     { "drm_guard",	drm_guard_init,			drm_guard_exit,		false, false },
+    /* Restores what the shipped HideGuard ko does and upstream does not:
+     * get_taint() reports 0, so /proc/sys/kernel/tainted stays clean. */
+    { "taint_spoof",	susfs_taint_spoof_init,		susfs_taint_spoof_exit,	false, false },
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
