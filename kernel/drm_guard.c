@@ -59,6 +59,7 @@ struct drm_stats {
 	atomic64_t read_streams;
 	atomic64_t parse_faults;
 	atomic64_t descriptor_hits;
+	atomic64_t property_hits;
 	atomic64_t request_hits;
 	atomic64_t reply_candidates;
 	atomic64_t would_replace;
@@ -149,7 +150,50 @@ struct drm_request_result {
 	bool code_match;
 	bool property_match;
 	bool descriptor_match;
+	u32 data_size_log;
+	u32 last_data_size;
 };
+
+/* Exact size of one write-stream command including its header, or 0 when the
+ * opcode is not in the table (the caller resynchronises by one word).  Sizes
+ * follow <uapi/linux/android/binder.h>: the payload is word aligned, so the
+ * whole record always lands on a 4-byte boundary. */
+static u32 drm_bc_record_size(u32 cmd)
+{
+	switch (cmd) {
+	case BC_TRANSACTION:
+	case BC_REPLY:
+		return sizeof(u32) + sizeof(struct binder_transaction_data);
+#ifdef BC_TRANSACTION_SEC_CTX
+	case BC_TRANSACTION_SEC_CTX:
+		return sizeof(u32) + sizeof(struct binder_transaction_data) +
+		       sizeof(binder_uintptr_t);
+#endif
+	case BC_FREE_BUFFER:
+	case BC_DEAD_BINDER_DONE:
+		return sizeof(u32) + sizeof(binder_uintptr_t);
+	case BC_INCREFS:
+	case BC_ACQUIRE:
+	case BC_RELEASE:
+	case BC_DECREFS:
+		return sizeof(u32) + sizeof(u32);
+	case BC_ACQUIRE_RESULT:
+		return sizeof(u32) + sizeof(u32);
+	case BC_ATTEMPT_ACQUIRE:
+		return sizeof(u32) + 2 * sizeof(u32);
+	case BC_INCREFS_DONE:
+	case BC_ACQUIRE_DONE:
+	case BC_REQUEST_DEATH_NOTIFICATION:
+	case BC_CLEAR_DEATH_NOTIFICATION:
+		return sizeof(u32) + 2 * sizeof(binder_uintptr_t);
+	case BC_REGISTER_LOOPER:
+	case BC_ENTER_LOOPER:
+	case BC_EXIT_LOOPER:
+		return sizeof(u32);
+	default:
+		return 0;
+	}
+}
 
 /* Walk the write stream (BC_* commands) looking for one DRM getPropertyByteArray
  * request carrying "deviceUniqueId". */
@@ -170,37 +214,38 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 		if (copy_from_user(&cmd, stream + off, sizeof(cmd)))
 			return;
 
-		if (cmd != BC_TRANSACTION
-#ifdef BC_TRANSACTION_SEC_CTX
-		    && cmd != BC_TRANSACTION_SEC_CTX
-#endif
-		   )
-			break;
-		if (off + sizeof(u32) + sizeof(td) > consumed)
-			return;
-		if (copy_from_user(&td, stream + off + sizeof(u32), sizeof(td)))
-			return;
+		if (cmd == BC_TRANSACTION) {
+			if (off + sizeof(u32) + sizeof(td) > consumed)
+				return;
+			if (copy_from_user(&td, stream + off + sizeof(u32),
+					   sizeof(td)))
+				return;
+			if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY &&
+			    td.data_size >= 8 && td.data.ptr.buffer) {
+				const void __user *parcel =
+					(const void __user *)td.data.ptr.buffer;
 
-		if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY &&
-		    td.data_size >= 8 && td.data.ptr.buffer) {
-			const void __user *parcel =
-				(const void __user *)td.data.ptr.buffer;
-
-			out->code_match = true;
-			if (drm_user_has_token(parcel, td.data_size,
-					       kDeviceUniqueId))
-				out->property_match = true;
-			if (drm_user_has_token(parcel, td.data_size,
-					       kDrmDescriptor))
-				out->descriptor_match = true;
+				out->code_match = true;
+				if (drm_user_has_token(parcel, td.data_size,
+						       kDeviceUniqueId))
+					out->property_match = true;
+				if (drm_user_has_token(parcel, td.data_size,
+						       kDrmDescriptor))
+					out->descriptor_match = true;
+				if (out->code_match && out->data_size_log < 4) {
+					out->data_size_log++;
+					out->last_data_size = td.data_size;
+				}
+			}
 		}
 
-		step = sizeof(u32) + sizeof(td);
-#ifdef BC_TRANSACTION_SEC_CTX
-		if (cmd == BC_TRANSACTION_SEC_CTX)
-			step += sizeof(binder_uintptr_t);
-#endif
-		if (step == 0 || off + step <= off)
+		step = drm_bc_record_size(cmd);
+		/* Unknown opcode: resynchronise by one word instead of giving up
+		 * on the whole stream - one alien record must not hide a DRM
+		 * request that comes after it. */
+		if (!step)
+			step = sizeof(u32);
+		if (off + step <= off)
 			return;
 		off += step;
 	}
@@ -312,8 +357,17 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	atomic64_inc(&g_stats.read_streams);
 	reply = drm_scan_read_stream(&bwr);
 
-	if (req.code_match)
-		atomic64_inc(&g_stats.request_hits);
+	if (req.code_match) {
+		/* Diagnostics: the first few code==11 requests, whatever interface
+		 * they belong to, so a wrong assumption is visible in dmesg. */
+		if (atomic64_inc_return(&g_stats.request_hits) <= 6)
+			pr_info("code11 tgid=%d data_size=%u desc=%d prop=%d\n",
+				current->tgid, req.last_data_size,
+				req.descriptor_match ? 1 : 0,
+				req.property_match ? 1 : 0);
+	}
+	if (req.property_match)
+		atomic64_inc(&g_stats.property_hits);
 	if (req.descriptor_match)
 		atomic64_inc(&g_stats.descriptor_hits);
 	if (reply)
@@ -388,6 +442,8 @@ static int drm_proc_show(struct seq_file *m, void *v)
 		   atomic64_read(&g_stats.parse_faults));
 	seq_printf(m, "request_hits=%lld\n",
 		   atomic64_read(&g_stats.request_hits));
+	seq_printf(m, "property_hits=%lld\n",
+		   atomic64_read(&g_stats.property_hits));
 	seq_printf(m, "descriptor_hits=%lld\n",
 		   atomic64_read(&g_stats.descriptor_hits));
 	seq_printf(m, "reply_candidates=%lld\n",
