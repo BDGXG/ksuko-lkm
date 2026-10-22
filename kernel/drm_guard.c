@@ -333,8 +333,10 @@ struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 
 if (!READ_ONCE(g_enable))
 return 1;
-if (!drm_uid_allowed())
+if (!drm_uid_allowed()) {
+if (!(READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)))
 return 1;
+}
 ctx->arg = regs->regs[2];
 ctx->cmd = (u32)regs->regs[1];
 ctx->reserved = 0;
@@ -449,6 +451,9 @@ seq_printf(m, "exact_hits=%lld\n", atomic64_read(&g_stats.exact_hits));
 seq_printf(m, "would_write=%lld\n", atomic64_read(&g_stats.would_write));
 seq_printf(m, "written=%lld\n", atomic64_read(&g_stats.written));
 seq_printf(m, "nofault_fail=%lld\n", atomic64_read(&g_stats.nofault_fail));
+seq_printf(m, "w_cand=%lld w_written=%lld req_seen=%lld w_skipped=%lld\n",
+atomic64_read(&g_stats.w_cand), atomic64_read(&g_stats.w_written),
+atomic64_read(&g_stats.req_seen), atomic64_read(&g_stats.w_skipped));
 seq_printf(m, "reply ge8=%lld sz40=%lld st0=%lld len32=%lld stop_unknown=%lld\n",
 atomic64_read(&g_stats.r_ge8), atomic64_read(&g_stats.r_sz40),
 atomic64_read(&g_stats.r_st0), atomic64_read(&g_stats.r_len32),
