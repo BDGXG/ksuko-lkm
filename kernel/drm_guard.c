@@ -161,8 +161,7 @@ u32 cmd, step;
 struct binder_transaction_data td;
 if (drm_u_read(&cmd, stream + off, sizeof(cmd))) {
 if (atomic64_inc_return(&g_stats.diag) <= 3)
-pr_info("scan fail tgid=%d comm=%s arg=%px rb=%px rsize=%u rcons=%u
-",
+pr_info("scan fail tgid=%d comm=%s arg=%px rb=%px rsize=%u rcons=%u\n",
 current->tgid, current->comm, (void *)bwr->read_buffer,
 stream, bwr->read_size, bwr->read_consumed);
 break;
