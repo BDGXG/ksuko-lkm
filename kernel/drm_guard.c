@@ -49,6 +49,7 @@ struct drm_stats {
 atomic64_t calls, read_streams, reply_seen, exact_hits;
 atomic64_t would_write, written, nofault_fail;
 atomic64_t c_cmd, c_ret, c_arg, c_bwr, c_noread;
+atomic64_t diag;
 };
 
 static struct drm_stats g_stats;
@@ -148,6 +149,14 @@ u32 off = 0;
 if (!stream || !want)
 return;
 atomic64_inc(&g_stats.read_streams);
+if (drm_u_read(buf, stream, want)) {
+if (atomic64_inc_return(&g_stats.diag) <= 3)
+pr_info("scan read fail: rb=%px want=%u consumed=%u size=%u aok=%d
+",
+stream, want, bwr->read_consumed, bwr->read_size,
+access_ok(stream, want) ? 1 : 0);
+return;
+}
 while (off + sizeof(u32) <= want) {
 u32 cmd, step;
 struct binder_transaction_data td;
