@@ -50,6 +50,7 @@ atomic64_t calls, read_streams, reply_seen, exact_hits;
 atomic64_t would_write, written, nofault_fail;
 atomic64_t c_cmd, c_ret, c_arg, c_bwr, c_noread;
 atomic64_t diag;
+atomic64_t kaddr_hits;
 };
 
 static struct drm_stats g_stats;
@@ -70,8 +71,11 @@ return false;
 static int drm_u_read(void *dst, const void __user *src, size_t n)
 {
 if (copy_from_user_nofault(dst, src, n)) {
+if (copy_from_kernel_nofault(dst, (const void *)src, n)) {
 atomic64_inc(&g_stats.nofault_fail);
 return -EFAULT;
+}
+atomic64_inc(&g_stats.kaddr_hits);
 }
 return 0;
 }
@@ -155,8 +159,14 @@ atomic64_inc(&g_stats.read_streams);
 while (off + sizeof(u32) <= want) {
 u32 cmd, step;
 struct binder_transaction_data td;
-if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+if (drm_u_read(&cmd, stream + off, sizeof(cmd))) {
+if (atomic64_inc_return(&g_stats.diag) <= 3)
+pr_info("scan fail tgid=%d comm=%s arg=%px rb=%px rsize=%u rcons=%u
+",
+current->tgid, current->comm, (void *)bwr->read_buffer,
+stream, bwr->read_size, bwr->read_consumed);
 break;
+}
 step = drm_rec_size(cmd);
 if (!step || off + step > want)
 break;
