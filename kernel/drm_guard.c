@@ -1,23 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * drm_guard.c - Widevine "deviceUniqueId" interception, M1.5 (dry-run + diagnostics).
+ * drm_guard.c - Widevine "deviceUniqueId" interception, M2 (per-uid, opt-in).
  *
- * Same dry-run behaviour as M1 - not a single byte is ever modified - plus the three
- * measurements M2 depends on:
+ * 为什么 M1/M1.5 会把系统卡死：kprobe handler 跑在关抢占的原子上下文，
+ * copy_from_user() 在页不存在时会走缺页流程、可能睡眠 -> scheduling while
+ * atomic，而 binder_ioctl 是每秒上万次的热点，于是 binder 线程池被钉死。
+ * 这里用户内存一律 copy_*_user_nofault()（内部 pagefault_disable，不睡眠），
+ * 缓冲区改用 per-CPU 静态块，不再 kmalloc(GFP_ATOMIC)。
  *
- *   1. whether BR_REPLY carries code == 11 (if it does, the matcher does not need the
- *      request side at all:  code==11 && status==0 && len==32  is enough);
- *   2. whether request and reply land in the SAME binder_ioctl (libbinder usually
- *      writes and reads in one BINDER_WRITE_READ, but a slow HAL splits it, and the
- *      M1 matcher required both halves in one call);
- *   3. who the reply actually belongs to: the BR_REPLY is consumed by the APP, so
- *      gating the entry handler on the HAL tgid filters out every hit.  That gate
- *      stays OFF here (g_hal_enforce is only reported, never used to skip).
- *
- * Recognition rules are unchanged from M1 / DRMID 1.4.0:
- *   request : BC_TRANSACTION, code 11 (IDrmPlugin::getPropertyByteArray), parcel
- *             carries "deviceUniqueId"
- *   reply   : BR_REPLY, status == 0, byte-array length exactly 32
+ * 触发模型（M1.5 实测）：请求和回复经常不在同一次 ioctl；BR_REPLY 的 code
+ * 恒为 0、sender_pid 恒为 0，回复无法自证身份。因此只能靠「40 字节的
+ * [0][32][32B] 回复 + uid 白名单」匹配，并默认 dry-run / fail-closed。
  */
 #define pr_fmt(fmt) "drm_guard: " fmt
 
@@ -30,6 +23,8 @@
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
 #include <linux/atomic.h>
+#include <linux/percpu.h>
+#include <linux/random.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <uapi/linux/android/binder.h>
@@ -37,589 +32,370 @@
 #include "drm_guard.h"
 
 #define DRM_ID_BYTES 32
-/* Bounded prefix scan, same idea as the original 256-byte parcel prefix with a
- * wider window: a DRM property parcel is small, we never walk a megabyte. */
-#define DRM_SCAN_BYTES 4096
-#define DRM_CHUNK_BYTES 256
-#define DRM_OVERLAP_BYTES 48
-#define DRM_GET_PROPERTY_BYTE_ARRAY 11
-#define DRM_HAL_LIMIT 4
-/* Distinct (code,len) pairs reported to dmesg before the sampler goes quiet. */
-#define DRM_COMBO_LIMIT 8
+#define DRM_PARCEL_BYTES (8 + DRM_ID_BYTES)
+#define DRM_SCAN_BYTES 512
+#define DRM_UID_LIMIT 32
 
-static const char kDrmDescriptor[] = "android.hardware.drm.IDrmPlugin";
-static const char kDeviceUniqueId[] = "deviceUniqueId";
+static u8 g_vid[DRM_ID_BYTES];
+static bool g_enable;
+static bool g_apply;
+static u32 g_uids[DRM_UID_LIMIT];
+static u32 g_uid_count;
+static DEFINE_MUTEX(g_ctl_lock);
 
-struct drm_call_ctx {
-	unsigned long arg;
-	unsigned int cmd;
-	unsigned int reserved;
-};
+struct drm_call_ctx { unsigned long arg; u32 cmd; u32 reserved; };
 
 struct drm_stats {
-	atomic64_t calls;
-	atomic64_t write_streams;
-	atomic64_t read_streams;
-	atomic64_t parse_faults;
-	atomic64_t descriptor_hits;
-	atomic64_t property_hits;
-	atomic64_t request_hits;
-	atomic64_t reply_candidates;
-	atomic64_t would_replace;
-	atomic64_t reported;
-	/* ---- M1.5 ---- */
-	atomic64_t reply_code11;	/* candidate replies whose code == 11 */
-	atomic64_t reply_bad_code;	/* candidate replies with any other code */
-	atomic64_t reply_only;		/* candidate reply, no request in the same ioctl */
-	atomic64_t request_only;	/* request seen, no reply in the same ioctl */
-};
-
-struct drm_reply_info {
-	bool candidate;
-	u32 code;			/* binder_transaction_data.code of the reply */
-	u32 sender_pid;
-	u32 data_size;
-	u32 array_len;			/* the [status][len] header's len */
+atomic64_t calls, read_streams, reply_seen, exact_hits;
+atomic64_t would_write, written, nofault_fail;
 };
 
 static struct drm_stats g_stats;
-static u32 g_hal_tgids[DRM_HAL_LIMIT];
-static u32 g_hal_count;
-/* Reported only.  Non-zero would make drm_hal_allowed() reject every app-side
- * reply (the reply is read by the caller, not by the HAL), so nothing skips. */
-static u32 g_hal_enforce;
+static DEFINE_PER_CPU(u8, g_scan_buf[DRM_SCAN_BYTES]);
 
-/* Distinct (code, len) sampler: enough to tell "reply carries code 11" from
- * "reply carries 0" on the very first DRM access, without flooding dmesg. */
-static u32 g_combo_code[DRM_COMBO_LIMIT];
-static u32 g_combo_len[DRM_COMBO_LIMIT];
-static u32 g_combo_size[DRM_COMBO_LIMIT];
-static atomic_t g_combo_n = ATOMIC_INIT(0);
-
-static bool drm_hal_gate_active(void)
+static bool drm_uid_allowed(void)
 {
-	return READ_ONCE(g_hal_enforce) != 0 && READ_ONCE(g_hal_count) != 0;
+u32 uid = __kuid_val(current_uid());
+u32 i, n = READ_ONCE(g_uid_count);
+
+if (!n)
+return false;
+for (i = 0; i < n && i < DRM_UID_LIMIT; i++)
+if (READ_ONCE(g_uids[i]) == uid)
+return true;
+return false;
 }
 
-static bool drm_hal_allowed(u32 tgid)
+static int drm_u_read(void *dst, const void __user *src, size_t n)
 {
-	u32 count = READ_ONCE(g_hal_count);
-	u32 i;
-
-	if (!READ_ONCE(g_hal_enforce))
-		return true;
-	for (i = 0; i < count && i < DRM_HAL_LIMIT; i++) {
-		if (READ_ONCE(g_hal_tgids[i]) == tgid)
-			return true;
-	}
-	return false;
+if (copy_from_user_nofault(dst, src, n)) {
+atomic64_inc(&g_stats.nofault_fail);
+return -EFAULT;
+}
+return 0;
 }
 
-static void drm_note_combo(u32 code, u32 len, u32 data_size)
+static int drm_u_write(void __user *dst, const void *src, size_t n)
 {
-	u32 i, n;
-
-	for (i = 0; i < DRM_COMBO_LIMIT; i++) {
-		if (READ_ONCE(g_combo_code[i]) == code &&
-		    READ_ONCE(g_combo_len[i]) == len)
-			return;
-	}
-	n = (u32)atomic_inc_return(&g_combo_n);
-	if (n > DRM_COMBO_LIMIT)
-		return;
-	WRITE_ONCE(g_combo_code[n - 1], code);
-	WRITE_ONCE(g_combo_len[n - 1], len);
-	WRITE_ONCE(g_combo_size[n - 1], data_size);
-	pr_info("BR_REPLY sample: code=%u len=%u data_size=%u\n",
-		code, len, data_size);
+if (copy_to_user_nofault(dst, src, n)) {
+atomic64_inc(&g_stats.nofault_fail);
+return -EFAULT;
+}
+return 0;
 }
 
-/* Byte search over a kernel buffer, both UTF-16LE (Parcel::writeString16) and
- * raw UTF-8 (the NDK String framing the original also has a fallback for). */
-static bool drm_buf_has_token(const u8 *buf, size_t len, const char *token)
+static bool drm_try_patch(struct binder_transaction_data *td)
 {
-	size_t tlen = strlen(token);
-	size_t i, j;
+void __user *parcel = (void __user *)td->data.ptr.buffer;
+u8 head[DRM_PARCEL_BYTES];
+u32 status, len, i, nz = 0;
 
-	if (len < tlen)
-		return false;
-	for (i = 0; i + tlen <= len; i++) {
-		for (j = 0; j < tlen; j++) {
-			if (buf[i + j] != (u8)token[j])
-				break;
-		}
-		if (j == tlen)
-			return true;
-	}
-	if (len < tlen * 2)
-		return false;
-	for (i = 0; i + tlen * 2 <= len; i++) {
-		for (j = 0; j < tlen; j++) {
-			if (buf[i + j * 2] != (u8)token[j] ||
-			    buf[i + j * 2 + 1] != 0)
-				break;
-		}
-		if (j == tlen)
-			return true;
-	}
-	return false;
+if (!parcel || td->data_size != DRM_PARCEL_BYTES || td->offsets_size)
+return false;
+if (drm_u_read(head, parcel, sizeof(head)))
+return false;
+memcpy(&status, head, 4);
+memcpy(&len, head + 4, 4);
+if (status != 0 || len != DRM_ID_BYTES)
+return false;
+for (i = 0; i < DRM_ID_BYTES; i++)
+nz |= head[8 + i];
+if (!nz)
+return false;
+
+atomic64_inc(&g_stats.exact_hits);
+if (!READ_ONCE(g_apply)) {
+atomic64_inc(&g_stats.would_write);
+return false;
+}
+if (drm_u_write((u8 __user *)parcel + 8, g_vid, DRM_ID_BYTES))
+return false;
+atomic64_inc(&g_stats.written);
+return true;
 }
 
-/* Chunked user-memory scan: a fault is never read as a hit. */
-static bool drm_user_has_token(const void __user *base, size_t size,
-			       const char *token)
+static u32 drm_rec_size(u32 cmd)
 {
-	u8 chunk[DRM_CHUNK_BYTES + DRM_OVERLAP_BYTES];
-	size_t cap = min_t(size_t, size, DRM_SCAN_BYTES);
-	size_t off = 0;
-
-	if (!base || size < strlen(token))
-		return false;
-	while (off < cap) {
-		size_t n = min_t(size_t, cap - off, sizeof(chunk));
-
-		if (copy_from_user(chunk, (const u8 __user *)base + off, n))
-			return false;
-		if (drm_buf_has_token(chunk, n, token))
-			return true;
-		if (n <= DRM_OVERLAP_BYTES)
-			break;
-		off += n - DRM_OVERLAP_BYTES;
-	}
-	return false;
+switch (cmd) {
+case BR_TRANSACTION:
+case BR_REPLY:
+return sizeof(u32) + sizeof(struct binder_transaction_data);
+case BR_INCREFS:
+case BR_ACQUIRE:
+case BR_RELEASE:
+case BR_DECREFS:
+case BR_ATTEMPT_ACQUIRE:
+return sizeof(u32) + 2 * sizeof(binder_uintptr_t);
+case BR_DEAD_BINDER:
+case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+return sizeof(u32) + sizeof(binder_uintptr_t);
+case BR_NOOP:
+case BR_TRANSACTION_COMPLETE:
+case BR_DEAD_REPLY:
+case BR_FAILED_REPLY:
+case BR_SPAWN_LOOPER:
+return sizeof(u32);
+default:
+return 0;
+}
 }
 
-struct drm_request_result {
-	bool code_match;
-	bool property_match;
-	bool descriptor_match;
-	u32 data_size_log;
-	u32 last_data_size;
-};
-
-/* Exact size of one write-stream command including its header, or 0 when the
- * opcode is not in the table (the caller resynchronises by one word).  Sizes
- * follow <uapi/linux/android/binder.h>: the payload is word aligned, so the
- * whole record always lands on a 4-byte boundary. */
-static u32 drm_bc_record_size(u32 cmd)
+static void drm_scan_read(struct binder_write_read *bwr)
 {
-	switch (cmd) {
-	case BC_TRANSACTION:
-	case BC_REPLY:
-		return sizeof(u32) + sizeof(struct binder_transaction_data);
-#ifdef BC_TRANSACTION_SEC_CTX
-	case BC_TRANSACTION_SEC_CTX:
-		return sizeof(u32) + sizeof(struct binder_transaction_data) +
-		       sizeof(binder_uintptr_t);
-#endif
-	case BC_FREE_BUFFER:
-	case BC_DEAD_BINDER_DONE:
-		return sizeof(u32) + sizeof(binder_uintptr_t);
-	case BC_INCREFS:
-	case BC_ACQUIRE:
-	case BC_RELEASE:
-	case BC_DECREFS:
-		return sizeof(u32) + sizeof(u32);
-	case BC_ACQUIRE_RESULT:
-		return sizeof(u32) + sizeof(u32);
-	case BC_ATTEMPT_ACQUIRE:
-		return sizeof(u32) + 2 * sizeof(u32);
-	case BC_INCREFS_DONE:
-	case BC_ACQUIRE_DONE:
-	case BC_REQUEST_DEATH_NOTIFICATION:
-	case BC_CLEAR_DEATH_NOTIFICATION:
-		return sizeof(u32) + 2 * sizeof(binder_uintptr_t);
-	case BC_REGISTER_LOOPER:
-	case BC_ENTER_LOOPER:
-	case BC_EXIT_LOOPER:
-		return sizeof(u32);
-	default:
-		return 0;
-	}
+const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
+u32 want = min_t(u32, bwr->read_consumed, DRM_SCAN_BYTES);
+u8 *buf = (u8 *)this_cpu_ptr(&g_scan_buf);
+u32 off = 0;
+
+if (!stream || !want)
+return;
+atomic64_inc(&g_stats.read_streams);
+if (drm_u_read(buf, stream, want))
+return;
+while (off + sizeof(u32) <= want) {
+u32 cmd, step;
+struct binder_transaction_data td;
+
+memcpy(&cmd, buf + off, sizeof(cmd));
+step = drm_rec_size(cmd);
+if (!step || off + step > want)
+return;
+if (cmd == BR_REPLY) {
+memcpy(&td, buf + off + sizeof(u32), sizeof(td));
+atomic64_inc(&g_stats.reply_seen);
+drm_try_patch(&td);
 }
-
-/* Walk the write stream (BC_* commands) looking for one DRM getPropertyByteArray
- * request carrying "deviceUniqueId". */
-static void drm_scan_write_stream(struct binder_write_read *bwr,
-				  struct drm_request_result *out)
-{
-	u32 consumed = READ_ONCE(bwr->write_consumed);
-	const u8 __user *stream = (const u8 __user *)bwr->write_buffer;
-	u32 off = 0;
-
-	if (!stream)
-		return;
-	while (off + sizeof(u32) <= consumed) {
-		u32 cmd;
-		struct binder_transaction_data td;
-		u32 step;
-
-		if (copy_from_user(&cmd, stream + off, sizeof(cmd)))
-			return;
-
-		if (cmd == BC_TRANSACTION) {
-			if (off + sizeof(u32) + sizeof(td) > consumed)
-				return;
-			if (copy_from_user(&td, stream + off + sizeof(u32),
-					   sizeof(td)))
-				return;
-			if (td.code == DRM_GET_PROPERTY_BYTE_ARRAY &&
-			    td.data_size >= 8 && td.data.ptr.buffer) {
-				const void __user *parcel =
-					(const void __user *)td.data.ptr.buffer;
-
-				out->code_match = true;
-				if (drm_user_has_token(parcel, td.data_size,
-						       kDeviceUniqueId))
-					out->property_match = true;
-				if (drm_user_has_token(parcel, td.data_size,
-						       kDrmDescriptor))
-					out->descriptor_match = true;
-				if (out->code_match && out->data_size_log < 4) {
-					out->data_size_log++;
-					out->last_data_size = td.data_size;
-				}
-			}
-		}
-
-		step = drm_bc_record_size(cmd);
-		/* Unknown opcode: resynchronise by one word instead of giving up
-		 * on the whole stream - one alien record must not hide a DRM
-		 * request that comes after it. */
-		if (!step)
-			step = sizeof(u32);
-		if (off + step <= off)
-			return;
-		off += step;
-	}
+off += step;
 }
-
-/* Walk the read stream (BR_* commands) looking for the 32-byte reply. */
-static bool drm_scan_read_stream(struct binder_write_read *bwr,
-				 struct drm_reply_info *info)
-{
-	u32 consumed = READ_ONCE(bwr->read_consumed);
-	const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
-	u32 off = 0;
-
-	if (!stream)
-		return false;
-	while (off + sizeof(u32) <= consumed) {
-		u32 cmd;
-		u32 step = 0;
-		bool candidate = false;
-		struct binder_transaction_data td;
-
-		if (copy_from_user(&cmd, stream + off, sizeof(cmd)))
-			return false;
-
-		switch (cmd) {
-		case BR_REPLY:
-		case BR_TRANSACTION:
-			if (off + sizeof(u32) + sizeof(td) > consumed)
-				return false;
-			if (copy_from_user(&td, stream + off + sizeof(u32),
-					   sizeof(td)))
-				return false;
-			step = sizeof(u32) + sizeof(td);
-			if (cmd == BR_REPLY && td.data_size >= 8 &&
-			    td.data.ptr.buffer) {
-				u32 hdr[2];
-
-				if (copy_from_user(
-					    hdr,
-					    (const void __user *)td.data.ptr.buffer,
-					    sizeof(hdr)))
-					return false;
-				/* Every BR_REPLY feeds the sampler, candidate or
-				 * not: what M2 needs to know is what `code` a
-				 * reply packet really carries. */
-				drm_note_combo(td.code, hdr[1], td.data_size);
-				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES) {
-					candidate = true;
-					info->candidate = true;
-					info->code = td.code;
-					info->sender_pid = td.sender_pid;
-					info->data_size = td.data_size;
-					info->array_len = hdr[1];
-				}
-			}
-			break;
-		case BR_INCREFS:
-		case BR_ACQUIRE:
-		case BR_RELEASE:
-		case BR_DECREFS:
-			step = sizeof(u32) + 2 * sizeof(binder_uintptr_t);
-			break;
-		case BR_DEAD_BINDER:
-		case BR_CLEAR_DEATH_NOTIFICATION_DONE:
-			step = sizeof(u32) + sizeof(binder_uintptr_t);
-			break;
-		case BR_NOOP:
-		case BR_TRANSACTION_COMPLETE:
-		case BR_DEAD_REPLY:
-		case BR_FAILED_REPLY:
-		case BR_SPAWN_LOOPER:
-			step = sizeof(u32);
-			break;
-		default:
-			return false;
-		}
-		if (candidate)
-			return true;
-		if (step == 0 || off + step <= off)
-			return false;
-		off += step;
-	}
-	return false;
 }
 
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
+struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 
-	/* Deliberately NOT gated on the HAL tgid: see the header.  The gate is
-	 * reported through /proc so a user-space publisher can be diagnosed, but
-	 * it must not decide whether a reply is inspected. */
-	ctx->arg = regs->regs[2];
-	ctx->cmd = (unsigned int)regs->regs[1];
-	ctx->reserved = 0;
-	atomic64_inc(&g_stats.calls);
-	return 0;
+if (!READ_ONCE(g_enable))
+return 1;
+if (!drm_uid_allowed())
+return 1;
+ctx->arg = regs->regs[2];
+ctx->cmd = (u32)regs->regs[1];
+ctx->reserved = 0;
+atomic64_inc(&g_stats.calls);
+return 0;
 }
 
 static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
-	struct binder_write_read bwr;
-	struct drm_request_result req = { };
-	struct drm_reply_info rep = { };
-	bool reply;
+struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
+struct binder_write_read bwr;
 
-	if (!ctx->arg)
-		return 0;
-	if (copy_from_user(&bwr, (void __user *)ctx->arg, sizeof(bwr))) {
-		atomic64_inc(&g_stats.parse_faults);
-		return 0;
-	}
-
-	if (bwr.write_size && bwr.write_consumed) {
-		atomic64_inc(&g_stats.write_streams);
-		drm_scan_write_stream(&bwr, &req);
-	}
-	if (!bwr.read_size || !bwr.read_consumed)
-		return 0;
-
-	atomic64_inc(&g_stats.read_streams);
-	reply = drm_scan_read_stream(&bwr, &rep);
-
-	if (req.code_match) {
-		/* Diagnostics: the first few code==11 requests, whatever interface
-		 * they belong to, so a wrong assumption is visible in dmesg. */
-		if (atomic64_inc_return(&g_stats.request_hits) <= 6)
-			pr_info("code11 tgid=%d data_size=%u desc=%d prop=%d\n",
-				current->tgid, req.last_data_size,
-				req.descriptor_match ? 1 : 0,
-				req.property_match ? 1 : 0);
-	}
-	if (req.property_match)
-		atomic64_inc(&g_stats.property_hits);
-	if (req.descriptor_match)
-		atomic64_inc(&g_stats.descriptor_hits);
-
-	if (reply) {
-		atomic64_inc(&g_stats.reply_candidates);
-		if (rep.code == DRM_GET_PROPERTY_BYTE_ARRAY)
-			atomic64_inc(&g_stats.reply_code11);
-		else
-			atomic64_inc(&g_stats.reply_bad_code);
-	}
-	if (reply && !req.property_match) {
-		/* Either the HAL answered after libbinder had already returned
-		 * from the write call (two ioctls), or the request side was not
-		 * recognised.  Both cases break the M1 matcher. */
-		if (atomic64_inc_return(&g_stats.reply_only) <= 6)
-			pr_info("reply without request: tgid=%d code=%u sender_pid=%u data_size=%u len=%u\n",
-				current->tgid, rep.code, rep.sender_pid,
-				rep.data_size, rep.array_len);
-	}
-	if (req.property_match && !reply)
-		atomic64_inc(&g_stats.request_only);
-
-	/* Dry-run: observe only. A rewrite needs request and reply in the same
-	 * synchronous ioctl, which is how getPropertyByteArray is issued. */
-	if (!req.property_match || !reply)
-		return 0;
-
-	atomic64_inc(&g_stats.would_replace);
-	if (atomic64_inc_return(&g_stats.reported) <= 3) {
-		pr_info("dry-run hit: tgid=%d pid=%d code=%u descriptor=%d reply_code=%u\n",
-			current->tgid, current->pid,
-			DRM_GET_PROPERTY_BYTE_ARRAY,
-			req.descriptor_match ? 1 : 0, rep.code);
-	}
-	return 0;
+if (ctx->cmd != BINDER_WRITE_READ || !ctx->arg)
+return 0;
+if (regs_return_value(regs) < 0)
+return 0;
+if (drm_u_read(&bwr, (void __user *)ctx->arg, sizeof(bwr)))
+return 0;
+if (!bwr.read_size || !bwr.read_consumed)
+return 0;
+drm_scan_read(&bwr);
+return 0;
 }
 
-static struct kretprobe g_drm_krp = {
-	.entry_handler = drm_entry_handler,
-	.handler = drm_ret_handler,
-	.data_size = sizeof(struct drm_call_ctx),
-	.maxactive = 64,
+static struct kretprobe g_krp = {
+.entry_handler = drm_entry_handler,
+.handler = drm_ret_handler,
+.data_size = sizeof(struct drm_call_ctx),
+.maxactive = 32,
 };
 
-static const char *const g_drm_probe_symbols[] = {
-	"binder_ioctl",
-	"binder_ioctl_write_read",
+static const char *const g_probe_symbols[] = {
+"binder_ioctl_write_read",
+"binder_ioctl",
 };
 
-static int drm_probe_arm(void)
+static bool g_armed;
+
+static int drm_arm_locked(void)
 {
-	size_t i;
-	int ret = -ENOENT;
+size_t i;
+int ret = -ENOENT;
 
-	for (i = 0; i < ARRAY_SIZE(g_drm_probe_symbols); i++) {
-		g_drm_krp.kp.symbol_name = g_drm_probe_symbols[i];
-		g_drm_krp.kp.addr = NULL;
-		ret = register_kretprobe(&g_drm_krp);
-		if (!ret) {
-			pr_info("kretprobe armed on %s\n", g_drm_krp.kp.symbol_name);
-			return 0;
-		}
-		g_drm_krp.kp.addr = NULL;
-	}
-	pr_warn("no probeable binder entry (%d)\n", ret);
-	return ret;
+if (g_armed)
+return 0;
+for (i = 0; i < ARRAY_SIZE(g_probe_symbols); i++) {
+g_krp.kp.symbol_name = g_probe_symbols[i];
+g_krp.kp.addr = NULL;
+ret = register_kretprobe(&g_krp);
+if (!ret) {
+g_armed = true;
+pr_info("kretprobe armed on %s\n", g_krp.kp.symbol_name);
+return 0;
+}
+g_krp.kp.addr = NULL;
+}
+pr_warn("no probeable binder entry (%d)\n", ret);
+return ret;
 }
 
-static void drm_probe_disarm(void)
+static void drm_disarm_locked(void)
 {
-	if (g_drm_krp.kp.symbol_name)
-		unregister_kretprobe(&g_drm_krp);
-	g_drm_krp.kp.addr = NULL;
+if (!g_armed)
+return;
+unregister_kretprobe(&g_krp);
+g_krp.kp.addr = NULL;
+g_armed = false;
+pr_info("kretprobe disarmed\n");
 }
 
 static int drm_proc_show(struct seq_file *m, void *v)
 {
-	u32 i, n;
+u32 i;
 
-	seq_printf(m, "mode=dry-run\n");
-	seq_printf(m, "probe=%s\n",
-		   g_drm_krp.kp.symbol_name ? g_drm_krp.kp.symbol_name : "off");
-	seq_printf(m, "hal_enforce=%u hal_count=%u (reported only, never filters)\n",
-		   READ_ONCE(g_hal_enforce), READ_ONCE(g_hal_count));
-	seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
-	seq_printf(m, "write_streams=%lld\n",
-		   atomic64_read(&g_stats.write_streams));
-	seq_printf(m, "read_streams=%lld\n",
-		   atomic64_read(&g_stats.read_streams));
-	seq_printf(m, "parse_faults=%lld\n",
-		   atomic64_read(&g_stats.parse_faults));
-	seq_printf(m, "request_hits=%lld\n",
-		   atomic64_read(&g_stats.request_hits));
-	seq_printf(m, "property_hits=%lld\n",
-		   atomic64_read(&g_stats.property_hits));
-	seq_printf(m, "descriptor_hits=%lld\n",
-		   atomic64_read(&g_stats.descriptor_hits));
-	seq_printf(m, "reply_candidates=%lld\n",
-		   atomic64_read(&g_stats.reply_candidates));
-	seq_printf(m, "reply_code11=%lld\n",
-		   atomic64_read(&g_stats.reply_code11));
-	seq_printf(m, "reply_bad_code=%lld\n",
-		   atomic64_read(&g_stats.reply_bad_code));
-	seq_printf(m, "reply_only=%lld\n",
-		   atomic64_read(&g_stats.reply_only));
-	seq_printf(m, "request_only=%lld\n",
-		   atomic64_read(&g_stats.request_only));
-	seq_printf(m, "would_replace=%lld\n",
-		   atomic64_read(&g_stats.would_replace));
-
-	n = min_t(u32, (u32)atomic_read(&g_combo_n), DRM_COMBO_LIMIT);
-	for (i = 0; i < n; i++)
-		seq_printf(m, "sample[%u]=code:%u len:%u data_size:%u\n", i,
-			   READ_ONCE(g_combo_code[i]),
-			   READ_ONCE(g_combo_len[i]),
-			   READ_ONCE(g_combo_size[i]));
-	return 0;
+seq_printf(m, "mode=%s\n", READ_ONCE(g_apply) ? "apply" : "dry-run");
+seq_printf(m, "enabled=%d armed=%d probe=%s\n", READ_ONCE(g_enable), g_armed,
+   g_krp.kp.symbol_name ? g_krp.kp.symbol_name : "off");
+seq_printf(m, "uids=%u\n", READ_ONCE(g_uid_count));
+for (i = 0; i < READ_ONCE(g_uid_count) && i < DRM_UID_LIMIT; i++)
+seq_printf(m, "  uid[%u]=%u\n", i, READ_ONCE(g_uids[i]));
+seq_puts(m, "id=");
+for (i = 0; i < DRM_ID_BYTES; i++)
+seq_printf(m, "%02x", g_vid[i]);
+seq_putc(m, '\n');
+seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
+seq_printf(m, "read_streams=%lld\n", atomic64_read(&g_stats.read_streams));
+seq_printf(m, "reply_seen=%lld\n", atomic64_read(&g_stats.reply_seen));
+seq_printf(m, "exact_hits=%lld\n", atomic64_read(&g_stats.exact_hits));
+seq_printf(m, "would_write=%lld\n", atomic64_read(&g_stats.would_write));
+seq_printf(m, "written=%lld\n", atomic64_read(&g_stats.written));
+seq_printf(m, "nofault_fail=%lld\n", atomic64_read(&g_stats.nofault_fail));
+return 0;
 }
 
 static int drm_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, drm_proc_show, NULL);
+return single_open(file, drm_proc_show, NULL);
+}
+
+static int drm_hex2bin(const char *s, u8 *out, int len)
+{
+int i, k;
+
+for (i = 0; i < len; i++) {
+u8 v = 0;
+for (k = 0; k < 2; k++) {
+char c = s[i * 2 + k];
+v <<= 4;
+if (c >= '0' && c <= '9')
+v |= c - '0';
+else if (c >= 'a' && c <= 'f')
+v |= c - 'a' + 10;
+else if (c >= 'A' && c <= 'F')
+v |= c - 'A' + 10;
+else
+return -EINVAL;
+}
+out[i] = v;
+}
+return 0;
 }
 
 static ssize_t drm_proc_write(struct file *file, const char __user *ubuf,
-			      size_t count, loff_t *ppos)
+      size_t count, loff_t *ppos)
 {
-	char buf[64];
-	size_t len = min_t(size_t, count, sizeof(buf) - 1);
-	u32 tgid = 0;
-	u32 i;
+char buf[256];
+size_t len = min_t(size_t, count, sizeof(buf) - 1);
+int ret = count;
 
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
+if (copy_from_user(buf, ubuf, len))
+return -EFAULT;
+buf[len] = 0;
+while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+buf[--len] = 0;
 
-	if (sysfs_streq(buf, "off") || sysfs_streq(buf, "reset")) {
-		WRITE_ONCE(g_hal_enforce, 0);
-		WRITE_ONCE(g_hal_count, 0);
-		memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
-		return count;
-	}
-	if (sscanf(buf, "hal %u", &tgid) != 1)
-		return -EINVAL;
-	if (tgid == 0) {
-		WRITE_ONCE(g_hal_enforce, 0);
-		return count;
-	}
-	for (i = 0; i < DRM_HAL_LIMIT; i++) {
-		if (READ_ONCE(g_hal_tgids[i]) == tgid)
-			return count;
-	}
-	for (i = 0; i < DRM_HAL_LIMIT; i++) {
-		if (!READ_ONCE(g_hal_tgids[i])) {
-			WRITE_ONCE(g_hal_tgids[i], tgid);
-			WRITE_ONCE(g_hal_count, READ_ONCE(g_hal_count) + 1);
-			WRITE_ONCE(g_hal_enforce, 1);
-			pr_info("hal tgid %u published (%u total)\n", tgid, i + 1);
-			return count;
-		}
-	}
-	return -ENOSPC;
+if (!strncmp(buf, "uids ", 5)) {
+char *p = buf + 5, *tok;
+u32 n = 0;
+mutex_lock(&g_ctl_lock);
+while ((tok = strsep(&p, ", ")) != NULL && n < DRM_UID_LIMIT) {
+u32 v;
+if (!*tok || kstrtouint(tok, 10, &v))
+continue;
+WRITE_ONCE(g_uids[n], v);
+n++;
+}
+WRITE_ONCE(g_uid_count, n);
+mutex_unlock(&g_ctl_lock);
+pr_info("uids published: %u\n", n);
+} else if (!strncmp(buf, "id ", 3)) {
+u8 tmp[DRM_ID_BYTES];
+if (drm_hex2bin(buf + 3, tmp, DRM_ID_BYTES))
+return -EINVAL;
+mutex_lock(&g_ctl_lock);
+memcpy(g_vid, tmp, DRM_ID_BYTES);
+mutex_unlock(&g_ctl_lock);
+pr_info("virtual id set\n");
+} else if (!strcmp(buf, "apply 1")) {
+WRITE_ONCE(g_apply, true);
+pr_warn("apply mode ON: replies will be rewritten\n");
+} else if (!strcmp(buf, "apply 0")) {
+WRITE_ONCE(g_apply, false);
+pr_info("dry-run mode\n");
+} else if (!strcmp(buf, "enable 1")) {
+mutex_lock(&g_ctl_lock);
+WRITE_ONCE(g_enable, true);
+if (drm_arm_locked())
+WRITE_ONCE(g_enable, false);
+mutex_unlock(&g_ctl_lock);
+} else if (!strcmp(buf, "enable 0")) {
+mutex_lock(&g_ctl_lock);
+WRITE_ONCE(g_enable, false);
+drm_disarm_locked();
+mutex_unlock(&g_ctl_lock);
+} else if (!strcmp(buf, "reset")) {
+atomic64_set(&g_stats.calls, 0);
+atomic64_set(&g_stats.read_streams, 0);
+atomic64_set(&g_stats.reply_seen, 0);
+atomic64_set(&g_stats.exact_hits, 0);
+atomic64_set(&g_stats.would_write, 0);
+atomic64_set(&g_stats.written, 0);
+atomic64_set(&g_stats.nofault_fail, 0);
+} else {
+return -EINVAL;
+}
+return ret;
 }
 
 static const struct proc_ops drm_proc_ops = {
-	.proc_open = drm_proc_open,
-	.proc_read = seq_read,
-	.proc_lseek = seq_lseek,
-	.proc_release = single_release,
-	.proc_write = drm_proc_write,
+.proc_open = drm_proc_open,
+.proc_read = seq_read,
+.proc_lseek = seq_lseek,
+.proc_release = single_release,
+.proc_write = drm_proc_write,
 };
 
-static struct proc_dir_entry *g_drm_proc;
+static struct proc_dir_entry *g_proc;
 
 int drm_guard_init(void)
 {
-	int ret;
-
-	memset(&g_stats, 0, sizeof(g_stats));
-	memset(g_hal_tgids, 0, sizeof(g_hal_tgids));
-
-	ret = drm_probe_arm();
-	if (ret)
-		return ret;
-
-	g_drm_proc = proc_create("susfs_drm_guard", 0644, NULL, &drm_proc_ops);
-	if (!g_drm_proc)
-		pr_warn("proc entry creation failed; counters unavailable\n");
-	return 0;
+get_random_bytes(g_vid, DRM_ID_BYTES);
+g_enable = false;
+g_apply = false;
+g_uid_count = 0;
+g_proc = proc_create("susfs_drm_guard", 0644, NULL, &drm_proc_ops);
+if (!g_proc)
+pr_warn("proc entry creation failed\n");
+pr_info("ready: disabled, dry-run, no uid whitelist\n");
+return 0;
 }
 
 void drm_guard_exit(void)
 {
-	if (g_drm_proc) {
-		proc_remove(g_drm_proc);
-		g_drm_proc = NULL;
-	}
-	drm_probe_disarm();
+mutex_lock(&g_ctl_lock);
+WRITE_ONCE(g_enable, false);
+drm_disarm_locked();
+mutex_unlock(&g_ctl_lock);
+if (g_proc) {
+proc_remove(g_proc);
+g_proc = NULL;
+}
 }
