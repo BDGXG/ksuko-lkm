@@ -23,6 +23,7 @@
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
 #include <linux/atomic.h>
+#include <linux/jiffies.h>
 #include <linux/percpu.h>
 #include <linux/random.h>
 #include <linux/string.h>
@@ -42,6 +43,7 @@ static bool g_apply;
 static u32 g_uids[DRM_UID_LIMIT];
 static u32 g_uid_count;
 static u32 g_hal_uid;
+static unsigned long g_pending; /* last DRM request (jiffies) */
 static DEFINE_MUTEX(g_ctl_lock);
 
 struct drm_call_ctx { unsigned long arg; u32 cmd; u32 reserved; };
@@ -54,6 +56,7 @@ atomic64_t diag;
 atomic64_t stop_unknown, r_ge8, r_sz40, r_st0, r_len32;
 atomic64_t diag2;
 atomic64_t w_cand, w_written;
+atomic64_t req_seen, w_skipped;
 atomic64_t kaddr_hits;
 };
 
@@ -292,6 +295,38 @@ off += step;
 }
 }
 
+
+static void drm_scan_request(struct binder_write_read *bwr)
+{
+const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
+u32 cap, want, off = 0;
+
+if (!stream)
+return;
+cap = min_t(u32, bwr->write_consumed, bwr->write_size);
+want = min_t(u32, cap, DRM_SCAN_BYTES);
+if (!want)
+return;
+while (off + sizeof(u32) <= want) {
+u32 cmd, step;
+struct binder_transaction_data td;
+if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+break;
+step = drm_bc_size(cmd);
+if (!step || off + step > want)
+break;
+if (cmd == BC_TRANSACTION) {
+if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
+break;
+if (td.code == 11) {
+WRITE_ONCE(g_pending, jiffies);
+atomic64_inc(&g_stats.req_seen);
+}
+}
+off += step;
+}
+}
+
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
@@ -328,10 +363,17 @@ atomic64_inc(&g_stats.c_bwr);
 return 0;
 }
 if (g_hal_uid && __kuid_val(current_uid()) == g_hal_uid) {
+unsigned long pend = READ_ONCE(g_pending);
+if (!pend || time_after(jiffies, pend + 2 * HZ)) {
+atomic64_inc(&g_stats.w_skipped);
+return 0;
+}
 if (bwr.write_size && bwr.write_consumed)
 drm_scan_write(&bwr);
 return 0;
 }
+if (bwr.write_size && bwr.write_consumed)
+drm_scan_request(&bwr);
 if (!bwr.read_size || !bwr.read_consumed) {
 atomic64_inc(&g_stats.c_noread);
 return 0;
