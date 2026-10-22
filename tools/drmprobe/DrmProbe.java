@@ -1,6 +1,5 @@
 package drmprobe;
 
-import android.app.ActivityThread;
 import android.content.pm.ApplicationInfo;
 import android.media.MediaDrm;
 import android.media.MediaDrmException;
