@@ -6,8 +6,8 @@ on:
   # at all.  A documentation-only push has nothing to compile.  (Same trigger the legacy branch
   # carries; kept in sync deliberately.)
   push:
-    branches-ignore:
-      - legacy
+    branches:
+      - main
     paths-ignore:
       - "**.md"
   # Pull requests build the same way, which is what a fork contribution needs: the first fork PR this
