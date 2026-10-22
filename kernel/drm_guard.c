@@ -41,6 +41,7 @@ static bool g_enable;
 static bool g_apply;
 static u32 g_uids[DRM_UID_LIMIT];
 static u32 g_uid_count;
+static u32 g_hal_uid;
 static DEFINE_MUTEX(g_ctl_lock);
 
 struct drm_call_ctx { unsigned long arg; u32 cmd; u32 reserved; };
@@ -52,6 +53,7 @@ atomic64_t c_cmd, c_ret, c_arg, c_bwr, c_noread;
 atomic64_t diag;
 atomic64_t stop_unknown, r_ge8, r_sz40, r_st0, r_len32;
 atomic64_t diag2;
+atomic64_t w_cand, w_written;
 atomic64_t kaddr_hits;
 };
 
@@ -199,6 +201,97 @@ drm_try_patch(&td);
 off += step;
 }
 }
+
+static u32 drm_bc_size(u32 cmd)
+{
+switch (cmd) {
+case BC_TRANSACTION:
+case BC_REPLY:
+return sizeof(u32) + sizeof(struct binder_transaction_data);
+case BC_FREE_BUFFER:
+case BC_DEAD_BINDER_DONE:
+return sizeof(u32) + sizeof(binder_uintptr_t);
+case BC_INCREFS:
+case BC_ACQUIRE:
+case BC_RELEASE:
+case BC_DECREFS:
+case BC_ACQUIRE_RESULT:
+return sizeof(u32) + sizeof(u32);
+case BC_ATTEMPT_ACQUIRE:
+return sizeof(u32) + 2 * sizeof(u32);
+case BC_INCREFS_DONE:
+case BC_ACQUIRE_DONE:
+case BC_REQUEST_DEATH_NOTIFICATION:
+case BC_CLEAR_DEATH_NOTIFICATION:
+return sizeof(u32) + 2 * sizeof(binder_uintptr_t);
+case BC_REGISTER_LOOPER:
+case BC_ENTER_LOOPER:
+case BC_EXIT_LOOPER:
+return sizeof(u32);
+default:
+return 0;
+}
+}
+
+static bool drm_patch_write_parcel(struct binder_transaction_data *td)
+{
+void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
+u8 head[DRM_PARCEL_BYTES];
+u32 status, len, i, nz = 0;
+
+if (!parcel || td->data_size != DRM_PARCEL_BYTES || td->offsets_size)
+return false;
+if (drm_u_read(head, parcel, sizeof(head)))
+return false;
+memcpy(&status, head, 4);
+memcpy(&len, head + 4, 4);
+if (status != 0 || len != DRM_ID_BYTES)
+return false;
+for (i = 0; i < DRM_ID_BYTES; i++)
+nz |= head[8 + i];
+if (!nz)
+return false;
+
+atomic64_inc(&g_stats.w_cand);
+if (!READ_ONCE(g_apply)) {
+atomic64_inc(&g_stats.would_write);
+return false;
+}
+if (drm_u_write((u8 __user *)parcel + 8, g_vid, DRM_ID_BYTES))
+return false;
+atomic64_inc(&g_stats.w_written);
+atomic64_inc(&g_stats.written);
+return true;
+}
+
+static void drm_scan_write(struct binder_write_read *bwr)
+{
+const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
+u32 cap, want, off = 0;
+
+if (!stream)
+return;
+cap = min_t(u32, bwr->write_consumed, bwr->write_size);
+want = min_t(u32, cap, DRM_SCAN_BYTES);
+if (!want)
+return;
+while (off + sizeof(u32) <= want) {
+u32 cmd, step;
+struct binder_transaction_data td;
+if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+break;
+step = drm_bc_size(cmd);
+if (!step || off + step > want)
+break;
+if (cmd == BC_REPLY) {
+if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
+break;
+drm_patch_write_parcel(&td);
+}
+off += step;
+}
+}
+
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
@@ -232,6 +325,11 @@ return 0;
 }
 if (drm_u_read(&bwr, (void __user *)drm_untag((unsigned long)ctx->arg), sizeof(bwr))) {
 atomic64_inc(&g_stats.c_bwr);
+return 0;
+}
+if (g_hal_uid && __kuid_val(current_uid()) == g_hal_uid) {
+if (bwr.write_size && bwr.write_consumed)
+drm_scan_write(&bwr);
 return 0;
 }
 if (!bwr.read_size || !bwr.read_consumed) {
@@ -295,7 +393,7 @@ u32 i;
 seq_printf(m, "mode=%s\n", READ_ONCE(g_apply) ? "apply" : "dry-run");
 seq_printf(m, "enabled=%d armed=%d probe=%s\n", READ_ONCE(g_enable), g_armed,
    g_krp.kp.symbol_name ? g_krp.kp.symbol_name : "off");
-seq_printf(m, "uids=%u\n", READ_ONCE(g_uid_count));
+seq_printf(m, "uids=%u haluid=%u\n", READ_ONCE(g_uid_count), READ_ONCE(g_hal_uid));
 for (i = 0; i < READ_ONCE(g_uid_count) && i < DRM_UID_LIMIT; i++)
 seq_printf(m, "  uid[%u]=%u\n", i, READ_ONCE(g_uids[i]));
 seq_puts(m, "id=");
@@ -375,6 +473,12 @@ n++;
 WRITE_ONCE(g_uid_count, n);
 mutex_unlock(&g_ctl_lock);
 pr_info("uids published: %u\n", n);
+} else if (!strncmp(buf, "haluid ", 7)) {
+u32 v;
+if (kstrtouint(buf + 7, 10, &v))
+return -EINVAL;
+WRITE_ONCE(g_hal_uid, v);
+pr_info("hal uid set: %u\n", v);
 } else if (!strncmp(buf, "id ", 3)) {
 u8 tmp[DRM_ID_BYTES];
 if (drm_hex2bin(buf + 3, tmp, DRM_ID_BYTES))
