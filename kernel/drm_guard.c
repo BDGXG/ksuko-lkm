@@ -33,7 +33,7 @@
 
 #define DRM_ID_BYTES 32
 #define DRM_PARCEL_BYTES (8 + DRM_ID_BYTES)
-#define DRM_SCAN_BYTES 512
+#define DRM_SCAN_BYTES 4096
 #define DRM_UID_LIMIT 32
 
 static u8 g_vid[DRM_ID_BYTES];
@@ -50,6 +50,8 @@ atomic64_t calls, read_streams, reply_seen, exact_hits;
 atomic64_t would_write, written, nofault_fail;
 atomic64_t c_cmd, c_ret, c_arg, c_bwr, c_noread;
 atomic64_t diag;
+atomic64_t stop_unknown, r_ge8, r_sz40, r_st0, r_len32;
+atomic64_t diag2;
 atomic64_t kaddr_hits;
 };
 
@@ -106,6 +108,13 @@ if (drm_u_read(head, parcel, sizeof(head)))
 return false;
 memcpy(&status, head, 4);
 memcpy(&len, head + 4, 4);
+if (status == 0)
+atomic64_inc(&g_stats.r_st0);
+if (len == DRM_ID_BYTES)
+atomic64_inc(&g_stats.r_len32);
+if (atomic64_inc_return(&g_stats.diag2) <= 6)
+pr_info("parcel dsz=%u st=%u len=%u
+", td->data_size, status, len);
 if (status != 0 || len != DRM_ID_BYTES)
 return false;
 for (i = 0; i < DRM_ID_BYTES; i++)
@@ -172,11 +181,19 @@ stream, (unsigned long long)bwr->read_size, (unsigned long long)bwr->read_consum
 break;
 }
 step = drm_rec_size(cmd);
-if (!step || off + step > want)
+if (!step) {
+atomic64_inc(&g_stats.stop_unknown);
+break;
+}
+if (off + step > want)
 break;
 if (cmd == BR_REPLY) {
 if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
 break;
+if (td.data_size >= 8)
+atomic64_inc(&g_stats.r_ge8);
+if (td.data_size == 40)
+atomic64_inc(&g_stats.r_sz40);
 atomic64_inc(&g_stats.reply_seen);
 drm_try_patch(&td);
 }
@@ -293,6 +310,10 @@ seq_printf(m, "exact_hits=%lld\n", atomic64_read(&g_stats.exact_hits));
 seq_printf(m, "would_write=%lld\n", atomic64_read(&g_stats.would_write));
 seq_printf(m, "written=%lld\n", atomic64_read(&g_stats.written));
 seq_printf(m, "nofault_fail=%lld\n", atomic64_read(&g_stats.nofault_fail));
+seq_printf(m, "reply ge8=%lld sz40=%lld st0=%lld len32=%lld stop_unknown=%lld\n",
+atomic64_read(&g_stats.r_ge8), atomic64_read(&g_stats.r_sz40),
+atomic64_read(&g_stats.r_st0), atomic64_read(&g_stats.r_len32),
+atomic64_read(&g_stats.stop_unknown));
 seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
    atomic64_read(&g_stats.c_cmd), atomic64_read(&g_stats.c_ret),
    atomic64_read(&g_stats.c_arg), atomic64_read(&g_stats.c_bwr),
