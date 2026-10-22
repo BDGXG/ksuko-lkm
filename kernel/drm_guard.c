@@ -59,6 +59,7 @@ atomic64_t diag2;
 atomic64_t w_cand, w_written;
 atomic64_t req_seen, w_skipped;
 atomic64_t k_cand, k_written;
+atomic64_t e_scan, e_gate, e_write;
 atomic64_t kaddr_hits;
 };
 
@@ -477,10 +478,14 @@ if (!drm_uid_allowed()) {
 if (READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)) {
 struct binder_write_read wb;
 unsigned long pend = READ_ONCE(g_pending);
-if (READ_ONCE(g_apply) && pend && !time_after(jiffies, pend + 2 * HZ) &&
-!drm_u_read(&wb, (void __user *)drm_untag((unsigned long)regs->regs[2]), sizeof(wb)) &&
-wb.write_size && wb.write_buffer)
+atomic64_inc(&g_stats.e_scan);
+if (!(READ_ONCE(g_apply) && pend && !time_after(jiffies, pend + 2 * HZ)))
+atomic64_inc(&g_stats.e_gate);
+else if (!drm_u_read(&wb, (void __user *)drm_untag((unsigned long)regs->regs[2]), sizeof(wb)) &&
+wb.write_size && wb.write_buffer) {
+atomic64_inc(&g_stats.e_write);
 drm_scan_write_entry(&wb);
+}
 }
 return 1;
 }
