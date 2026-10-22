@@ -51,7 +51,6 @@ atomic64_t would_write, written, nofault_fail;
 };
 
 static struct drm_stats g_stats;
-static DEFINE_PER_CPU(u8, g_scan_buf[DRM_SCAN_BYTES]);
 
 static bool drm_uid_allowed(void)
 {
@@ -144,24 +143,21 @@ static void drm_scan_read(struct binder_write_read *bwr)
 {
 const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
 u32 want = min_t(u32, bwr->read_consumed, DRM_SCAN_BYTES);
-u8 *buf = (u8 *)this_cpu_ptr(&g_scan_buf);
 u32 off = 0;
-
 if (!stream || !want)
 return;
 atomic64_inc(&g_stats.read_streams);
-if (drm_u_read(buf, stream, want))
-return;
 while (off + sizeof(u32) <= want) {
 u32 cmd, step;
 struct binder_transaction_data td;
-
-memcpy(&cmd, buf + off, sizeof(cmd));
+if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+return;
 step = drm_rec_size(cmd);
 if (!step || off + step > want)
 return;
 if (cmd == BR_REPLY) {
-memcpy(&td, buf + off + sizeof(u32), sizeof(td));
+if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
+return;
 atomic64_inc(&g_stats.reply_seen);
 drm_try_patch(&td);
 }
