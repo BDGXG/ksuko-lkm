@@ -113,8 +113,7 @@ atomic64_inc(&g_stats.r_st0);
 if (len == DRM_ID_BYTES)
 atomic64_inc(&g_stats.r_len32);
 if (atomic64_inc_return(&g_stats.diag2) <= 6)
-pr_info("parcel dsz=%u st=%u len=%u
-", td->data_size, status, len);
+pr_info("parcel dsz=%u st=%u len=%u\n", td->data_size, status, len);
 if (status != 0 || len != DRM_ID_BYTES)
 return false;
 for (i = 0; i < DRM_ID_BYTES; i++)
