@@ -59,11 +59,11 @@ atomic64_t diag2;
 atomic64_t w_cand, w_written;
 atomic64_t req_seen, w_skipped;
 atomic64_t k_cand, k_written;
-static bool g_kwrite;
 atomic64_t kaddr_hits;
 };
 
 static struct drm_stats g_stats;
+static bool g_kwrite;
 
 static bool drm_uid_allowed(void)
 {
