@@ -1,22 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * drm_guard.c - Widevine "deviceUniqueId" interception, M1 (dry-run).
+ * drm_guard.c - Widevine "deviceUniqueId" interception, M1.5 (dry-run + diagnostics).
  *
- * The recognition rules are carried over verbatim from the SKP device identity
- * module (DRMID 1.4.0):
+ * Same dry-run behaviour as M1 - not a single byte is ever modified - plus the three
+ * measurements M2 depends on:
  *
- *   request : BC_TRANSACTION whose binder_transaction_data.code == 11
- *             (IDrmPlugin::getPropertyByteArray) and whose parcel carries the
- *             UTF-16 property name "deviceUniqueId"
- *   reply   : BR_REPLY whose reply parcel starts with status == 0 followed by a
- *             byte-array length of exactly 32
- *   scope   : Widevine HAL processes only (tgid whitelist published from
- *             user space, mirroring hal_identity.cpp)
+ *   1. whether BR_REPLY carries code == 11 (if it does, the matcher does not need the
+ *      request side at all:  code==11 && status==0 && len==32  is enough);
+ *   2. whether request and reply land in the SAME binder_ioctl (libbinder usually
+ *      writes and reads in one BINDER_WRITE_READ, but a slow HAL splits it, and the
+ *      M1 matcher required both halves in one call);
+ *   3. who the reply actually belongs to: the BR_REPLY is consumed by the APP, so
+ *      gating the entry handler on the HAL tgid filters out every hit.  That gate
+ *      stays OFF here (g_hal_enforce is only reported, never used to skip).
  *
- * The hook is a kretprobe on binder_ioctl instead of the SKRoot kernel_module_kit
- * before/after hook, so no kernel text is patched and the matcher is plain C.
- * M1 never modifies a single byte: it only counts and (once per generation)
- * reports a hit to the kernel log.
+ * Recognition rules are unchanged from M1 / DRMID 1.4.0:
+ *   request : BC_TRANSACTION, code 11 (IDrmPlugin::getPropertyByteArray), parcel
+ *             carries "deviceUniqueId"
+ *   reply   : BR_REPLY, status == 0, byte-array length exactly 32
  */
 #define pr_fmt(fmt) "drm_guard: " fmt
 
@@ -43,6 +44,8 @@
 #define DRM_OVERLAP_BYTES 48
 #define DRM_GET_PROPERTY_BYTE_ARRAY 11
 #define DRM_HAL_LIMIT 4
+/* Distinct (code,len) pairs reported to dmesg before the sampler goes quiet. */
+#define DRM_COMBO_LIMIT 8
 
 static const char kDrmDescriptor[] = "android.hardware.drm.IDrmPlugin";
 static const char kDeviceUniqueId[] = "deviceUniqueId";
@@ -64,13 +67,34 @@ struct drm_stats {
 	atomic64_t reply_candidates;
 	atomic64_t would_replace;
 	atomic64_t reported;
+	/* ---- M1.5 ---- */
+	atomic64_t reply_code11;	/* candidate replies whose code == 11 */
+	atomic64_t reply_bad_code;	/* candidate replies with any other code */
+	atomic64_t reply_only;		/* candidate reply, no request in the same ioctl */
+	atomic64_t request_only;	/* request seen, no reply in the same ioctl */
+};
+
+struct drm_reply_info {
+	bool candidate;
+	u32 code;			/* binder_transaction_data.code of the reply */
+	u32 sender_pid;
+	u32 data_size;
+	u32 array_len;			/* the [status][len] header's len */
 };
 
 static struct drm_stats g_stats;
 static u32 g_hal_tgids[DRM_HAL_LIMIT];
 static u32 g_hal_count;
-/* 0 = observe every process (M1 default while no HAL whitelist is published). */
+/* Reported only.  Non-zero would make drm_hal_allowed() reject every app-side
+ * reply (the reply is read by the caller, not by the HAL), so nothing skips. */
 static u32 g_hal_enforce;
+
+/* Distinct (code, len) sampler: enough to tell "reply carries code 11" from
+ * "reply carries 0" on the very first DRM access, without flooding dmesg. */
+static u32 g_combo_code[DRM_COMBO_LIMIT];
+static u32 g_combo_len[DRM_COMBO_LIMIT];
+static u32 g_combo_size[DRM_COMBO_LIMIT];
+static atomic_t g_combo_n = ATOMIC_INIT(0);
 
 static bool drm_hal_gate_active(void)
 {
@@ -89,6 +113,25 @@ static bool drm_hal_allowed(u32 tgid)
 			return true;
 	}
 	return false;
+}
+
+static void drm_note_combo(u32 code, u32 len, u32 data_size)
+{
+	u32 i, n;
+
+	for (i = 0; i < DRM_COMBO_LIMIT; i++) {
+		if (READ_ONCE(g_combo_code[i]) == code &&
+		    READ_ONCE(g_combo_len[i]) == len)
+			return;
+	}
+	n = (u32)atomic_inc_return(&g_combo_n);
+	if (n > DRM_COMBO_LIMIT)
+		return;
+	WRITE_ONCE(g_combo_code[n - 1], code);
+	WRITE_ONCE(g_combo_len[n - 1], len);
+	WRITE_ONCE(g_combo_size[n - 1], data_size);
+	pr_info("BR_REPLY sample: code=%u len=%u data_size=%u\n",
+		code, len, data_size);
 }
 
 /* Byte search over a kernel buffer, both UTF-16LE (Parcel::writeString16) and
@@ -252,7 +295,8 @@ static void drm_scan_write_stream(struct binder_write_read *bwr,
 }
 
 /* Walk the read stream (BR_* commands) looking for the 32-byte reply. */
-static bool drm_scan_read_stream(struct binder_write_read *bwr)
+static bool drm_scan_read_stream(struct binder_write_read *bwr,
+				 struct drm_reply_info *info)
 {
 	u32 consumed = READ_ONCE(bwr->read_consumed);
 	const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
@@ -287,8 +331,18 @@ static bool drm_scan_read_stream(struct binder_write_read *bwr)
 					    (const void __user *)td.data.ptr.buffer,
 					    sizeof(hdr)))
 					return false;
-				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES)
+				/* Every BR_REPLY feeds the sampler, candidate or
+				 * not: what M2 needs to know is what `code` a
+				 * reply packet really carries. */
+				drm_note_combo(td.code, hdr[1], td.data_size);
+				if (hdr[0] == 0 && hdr[1] == DRM_ID_BYTES) {
 					candidate = true;
+					info->candidate = true;
+					info->code = td.code;
+					info->sender_pid = td.sender_pid;
+					info->data_size = td.data_size;
+					info->array_len = hdr[1];
+				}
 			}
 			break;
 		case BR_INCREFS:
@@ -324,8 +378,9 @@ static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 {
 	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 
-	if (drm_hal_gate_active() && !drm_hal_allowed(current->tgid))
-		return 1;
+	/* Deliberately NOT gated on the HAL tgid: see the header.  The gate is
+	 * reported through /proc so a user-space publisher can be diagnosed, but
+	 * it must not decide whether a reply is inspected. */
 	ctx->arg = regs->regs[2];
 	ctx->cmd = (unsigned int)regs->regs[1];
 	ctx->reserved = 0;
@@ -338,6 +393,7 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 	struct binder_write_read bwr;
 	struct drm_request_result req = { };
+	struct drm_reply_info rep = { };
 	bool reply;
 
 	if (!ctx->arg)
@@ -355,7 +411,7 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 
 	atomic64_inc(&g_stats.read_streams);
-	reply = drm_scan_read_stream(&bwr);
+	reply = drm_scan_read_stream(&bwr, &rep);
 
 	if (req.code_match) {
 		/* Diagnostics: the first few code==11 requests, whatever interface
@@ -370,8 +426,25 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 		atomic64_inc(&g_stats.property_hits);
 	if (req.descriptor_match)
 		atomic64_inc(&g_stats.descriptor_hits);
-	if (reply)
+
+	if (reply) {
 		atomic64_inc(&g_stats.reply_candidates);
+		if (rep.code == DRM_GET_PROPERTY_BYTE_ARRAY)
+			atomic64_inc(&g_stats.reply_code11);
+		else
+			atomic64_inc(&g_stats.reply_bad_code);
+	}
+	if (reply && !req.property_match) {
+		/* Either the HAL answered after libbinder had already returned
+		 * from the write call (two ioctls), or the request side was not
+		 * recognised.  Both cases break the M1 matcher. */
+		if (atomic64_inc_return(&g_stats.reply_only) <= 6)
+			pr_info("reply without request: tgid=%d code=%u sender_pid=%u data_size=%u len=%u\n",
+				current->tgid, rep.code, rep.sender_pid,
+				rep.data_size, rep.array_len);
+	}
+	if (req.property_match && !reply)
+		atomic64_inc(&g_stats.request_only);
 
 	/* Dry-run: observe only. A rewrite needs request and reply in the same
 	 * synchronous ioctl, which is how getPropertyByteArray is issued. */
@@ -380,10 +453,10 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	atomic64_inc(&g_stats.would_replace);
 	if (atomic64_inc_return(&g_stats.reported) <= 3) {
-		pr_info("dry-run hit: tgid=%d pid=%d code=%u descriptor=%d\n",
+		pr_info("dry-run hit: tgid=%d pid=%d code=%u descriptor=%d reply_code=%u\n",
 			current->tgid, current->pid,
 			DRM_GET_PROPERTY_BYTE_ARRAY,
-			req.descriptor_match ? 1 : 0);
+			req.descriptor_match ? 1 : 0, rep.code);
 	}
 	return 0;
 }
@@ -428,10 +501,12 @@ static void drm_probe_disarm(void)
 
 static int drm_proc_show(struct seq_file *m, void *v)
 {
+	u32 i, n;
+
 	seq_printf(m, "mode=dry-run\n");
 	seq_printf(m, "probe=%s\n",
 		   g_drm_krp.kp.symbol_name ? g_drm_krp.kp.symbol_name : "off");
-	seq_printf(m, "hal_enforce=%u hal_count=%u\n",
+	seq_printf(m, "hal_enforce=%u hal_count=%u (reported only, never filters)\n",
 		   READ_ONCE(g_hal_enforce), READ_ONCE(g_hal_count));
 	seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
 	seq_printf(m, "write_streams=%lld\n",
@@ -448,8 +523,23 @@ static int drm_proc_show(struct seq_file *m, void *v)
 		   atomic64_read(&g_stats.descriptor_hits));
 	seq_printf(m, "reply_candidates=%lld\n",
 		   atomic64_read(&g_stats.reply_candidates));
+	seq_printf(m, "reply_code11=%lld\n",
+		   atomic64_read(&g_stats.reply_code11));
+	seq_printf(m, "reply_bad_code=%lld\n",
+		   atomic64_read(&g_stats.reply_bad_code));
+	seq_printf(m, "reply_only=%lld\n",
+		   atomic64_read(&g_stats.reply_only));
+	seq_printf(m, "request_only=%lld\n",
+		   atomic64_read(&g_stats.request_only));
 	seq_printf(m, "would_replace=%lld\n",
 		   atomic64_read(&g_stats.would_replace));
+
+	n = min_t(u32, (u32)atomic_read(&g_combo_n), DRM_COMBO_LIMIT);
+	for (i = 0; i < n; i++)
+		seq_printf(m, "sample[%u]=code:%u len:%u data_size:%u\n", i,
+			   READ_ONCE(g_combo_code[i]),
+			   READ_ONCE(g_combo_len[i]),
+			   READ_ONCE(g_combo_size[i]));
 	return 0;
 }
 
