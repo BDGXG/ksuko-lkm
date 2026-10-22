@@ -1,0 +1,49 @@
+name: drmprobe
+
+# 只是把 tools/drmprobe/DrmProbe.java 编成一个小 jar，给 drm_guard 探针制造触发点。
+# 和 build-ddk 完全独立：不编译内核、不需要 DDK 镜像、不碰 ko。
+
+on:
+  push:
+    branches: [drm-m15]
+    paths:
+      - "tools/drmprobe/**"
+      - ".github/workflows/drmprobe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate Android SDK pieces
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> $GITHUB_ENV
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          ls "$SDK/platforms"
+          ls "$SDK/build-tools"
+          AJ=$(ls -d "$SDK"/platforms/android-*/android.jar | sort -V | tail -1)
+          D8=$(ls -d "$SDK"/build-tools/*/d8 | sort -V | tail -1)
+          echo "AJ=$AJ" >> $GITHUB_ENV
+          echo "D8=$D8" >> $GITHUB_ENV
+          echo "android.jar=$AJ"
+          echo "d8=$D8"
+
+      - name: Compile
+        run: |
+          mkdir -p out/classes out/dex
+          javac -source 8 -target 8 -bootclasspath "$AJ" -d out/classes \
+                tools/drmprobe/DrmProbe.java
+          "$D8" --min-api 29 --output out/dex out/classes/drmprobe/*.class
+          cd out/dex && zip -q -r ../../drmprobe.jar classes.dex
+          cd ../.. && ls -l drmprobe.jar && unzip -l drmprobe.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drmprobe.jar
+          path: drmprobe.jar
+          if-no-files-found: error
