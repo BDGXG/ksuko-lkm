@@ -370,7 +370,7 @@ static struct kretprobe g_nb_krp = {
 .maxactive = 16,
 };
 
-static int drm_tx_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int __nocfi drm_tx_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 unsigned int c = drm_cpu();
 struct drm_kbuf_slot *s = &g_kbuf[c];
