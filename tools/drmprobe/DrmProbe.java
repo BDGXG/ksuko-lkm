@@ -25,8 +25,11 @@ public final class DrmProbe {
         MediaDrm drm = null;
         try {
             drm = new MediaDrm(WIDEVINE);
-            System.out.println("opened widevine: securityLevel=" +
-                    drm.getPropertyString(MediaDrm.PROPERTY_SECURITY_LEVEL));
+            try {
+                System.out.println("securityLevel=" + drm.getPropertyString("securityLevel"));
+            } catch (Throwable t) {
+                System.out.println("securityLevel=<" + t.getClass().getSimpleName() + ">");
+            }
 
             byte[] id = drm.getPropertyByteArray(MediaDrm.PROPERTY_DEVICE_UNIQUE_ID);
             System.out.println("DEVICE_UNIQUE_ID=" + hex(id) + " len=" + id.length);
