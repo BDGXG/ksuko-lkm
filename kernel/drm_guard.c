@@ -59,11 +59,11 @@ atomic64_t diag2;
 atomic64_t w_cand, w_written;
 atomic64_t req_seen, w_skipped;
 atomic64_t k_cand, k_written;
-static bool g_kwrite;
 atomic64_t kaddr_hits;
 };
 
 static struct drm_stats g_stats;
+static bool g_kwrite;
 
 static bool drm_uid_allowed(void)
 {
@@ -438,6 +438,35 @@ pr_info("kbuf armed (binder_alloc_new_buf + binder_transaction)\n");
 return 0;
 }
 
+
+static void drm_scan_write_entry(struct binder_write_read *bwr)
+{
+const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
+u32 cap, want, off = 0;
+
+if (!stream)
+return;
+cap = min_t(u32, bwr->write_size, DRM_SCAN_BYTES);
+want = cap;
+if (!want)
+return;
+while (off + sizeof(u32) <= want) {
+u32 cmd, step;
+struct binder_transaction_data td;
+if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+break;
+step = drm_bc_size(cmd);
+if (!step || off + step > want)
+break;
+if (cmd == BC_REPLY) {
+if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
+break;
+drm_patch_write_parcel(&td);
+}
+off += step;
+}
+}
+
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
@@ -445,7 +474,14 @@ struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 if (!READ_ONCE(g_enable))
 return 1;
 if (!drm_uid_allowed()) {
-if (!(READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)))
+if (READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)) {
+struct binder_write_read wb;
+unsigned long pend = READ_ONCE(g_pending);
+if (READ_ONCE(g_apply) && pend && !time_after(jiffies, pend + 2 * HZ) &&
+!drm_u_read(&wb, (void __user *)drm_untag((unsigned long)regs->regs[2]), sizeof(wb)) &&
+wb.write_size && wb.write_buffer)
+drm_scan_write_entry(&wb);
+}
 return 1;
 }
 ctx->arg = regs->regs[2];
