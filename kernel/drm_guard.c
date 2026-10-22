@@ -96,7 +96,7 @@ return 0;
 
 static bool drm_try_patch(struct binder_transaction_data *td)
 {
-void __user *parcel = (void __user *)td->data.ptr.buffer;
+void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
 u8 head[DRM_PARCEL_BYTES];
 u32 status, len, i, nz = 0;
 
