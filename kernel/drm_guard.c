@@ -48,6 +48,7 @@ struct drm_call_ctx { unsigned long arg; u32 cmd; u32 reserved; };
 struct drm_stats {
 atomic64_t calls, read_streams, reply_seen, exact_hits;
 atomic64_t would_write, written, nofault_fail;
+atomic64_t c_cmd, c_ret, c_arg, c_bwr, c_noread;
 };
 
 static struct drm_stats g_stats;
@@ -184,15 +185,26 @@ static int drm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 struct binder_write_read bwr;
-
-if (ctx->cmd != BINDER_WRITE_READ || !ctx->arg)
+if (ctx->cmd != BINDER_WRITE_READ) {
+atomic64_inc(&g_stats.c_cmd);
 return 0;
-if (regs_return_value(regs) < 0)
+}
+if (!ctx->arg) {
+atomic64_inc(&g_stats.c_arg);
 return 0;
-if (drm_u_read(&bwr, (void __user *)ctx->arg, sizeof(bwr)))
+}
+if (regs_return_value(regs) < 0) {
+atomic64_inc(&g_stats.c_ret);
 return 0;
-if (!bwr.read_size || !bwr.read_consumed)
+}
+if (drm_u_read(&bwr, (void __user *)ctx->arg, sizeof(bwr))) {
+atomic64_inc(&g_stats.c_bwr);
 return 0;
+}
+if (!bwr.read_size || !bwr.read_consumed) {
+atomic64_inc(&g_stats.c_noread);
+return 0;
+}
 drm_scan_read(&bwr);
 return 0;
 }
@@ -205,8 +217,8 @@ static struct kretprobe g_krp = {
 };
 
 static const char *const g_probe_symbols[] = {
-"binder_ioctl_write_read",
 "binder_ioctl",
+"binder_ioctl_write_read",
 };
 
 static bool g_armed;
@@ -264,6 +276,10 @@ seq_printf(m, "exact_hits=%lld\n", atomic64_read(&g_stats.exact_hits));
 seq_printf(m, "would_write=%lld\n", atomic64_read(&g_stats.would_write));
 seq_printf(m, "written=%lld\n", atomic64_read(&g_stats.written));
 seq_printf(m, "nofault_fail=%lld\n", atomic64_read(&g_stats.nofault_fail));
+seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
+   atomic64_read(&g_stats.c_cmd), atomic64_read(&g_stats.c_ret),
+   atomic64_read(&g_stats.c_arg), atomic64_read(&g_stats.c_bwr),
+   atomic64_read(&g_stats.c_noread));
 return 0;
 }
 

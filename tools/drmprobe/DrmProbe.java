@@ -1,16 +1,22 @@
 package drmprobe;
 
+import android.app.ActivityThread;
+import android.content.pm.ApplicationInfo;
 import android.media.MediaDrm;
 import android.media.MediaDrmException;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.UUID;
 
 /**
- * 只做一件事：查一次 Widevine 的 deviceUniqueId，把 32 字节打出来。
+ * 查一次 Widevine 的 deviceUniqueId。
  *
- * app_process 环境里 ActivityThread.currentPackageName() 是 null，
- * MediaDrm(UUID) 会抛 "application package name cannot be null"，
- * 所以优先用反射走 MediaDrm(UUID, String) 那个带包名的构造函数。
+ * app_process 里 ActivityThread.currentPackageName() 是 null，而 MediaDrm 只有
+ * MediaDrm(UUID) 一个构造函数（内部会读 currentPackageName()），所以先伪造：
+ *   ActivityThread.systemMain() -> mBoundApplication = new AppBindData()
+ *   -> appInfo = new ApplicationInfo(); appInfo.packageName = "com.android.shell"
+ * 之后 MediaDrm(WIDEVINE) 才能构造出来。
  *
  * 运行（root）：
  *   CLASSPATH=/data/local/tmp/drmprobe.jar app_process /system/bin drmprobe.DrmProbe
@@ -26,26 +32,60 @@ public final class DrmProbe {
         return sb.toString();
     }
 
-    private static MediaDrm open() throws Exception {
+    private static void spoofPackage() {
         try {
-            return new MediaDrm(WIDEVINE);
-        } catch (IllegalArgumentException noPkg) {
-            System.out.println("one-arg ctor failed: " + noPkg.getMessage());
+            Class<?> atc = Class.forName("android.app.ActivityThread");
+            Object at = null;
+
+            Method cur = atc.getDeclaredMethod("currentActivityThread");
+            cur.setAccessible(true);
+            at = cur.invoke(null);
+            System.out.println("currentActivityThread=" + at);
+
+            if (at == null) {
+                Method sysMain = atc.getDeclaredMethod("systemMain");
+                sysMain.setAccessible(true);
+                at = sysMain.invoke(null);
+                System.out.println("systemMain -> " + at);
+            }
+            if (at == null) {
+                System.out.println("no ActivityThread, cannot spoof package");
+                return;
+            }
+
+            Field bf = atc.getDeclaredField("mBoundApplication");
+            bf.setAccessible(true);
+            Object bind = bf.get(at);
+            if (bind == null) {
+                Class<?> bindCls = Class.forName("android.app.ActivityThread$AppBindData");
+                Constructor<?> c = bindCls.getDeclaredConstructor();
+                c.setAccessible(true);
+                bind = c.newInstance();
+                bf.set(at, bind);
+            }
+
+            Field af = bind.getClass().getDeclaredField("appInfo");
+            af.setAccessible(true);
+            ApplicationInfo ai = (ApplicationInfo) af.get(bind);
+            if (ai == null) {
+                ai = new ApplicationInfo();
+                af.set(bind, ai);
+            }
+            ai.packageName = FAKE_PKG;
+            ai.uid = 0;
+            System.out.println("package spoofed -> " + ai.packageName);
+        } catch (Throwable t) {
+            System.out.println("spoof failed: " + t.getClass().getName() + ": " + t.getMessage());
         }
-        for (Constructor<?> c : MediaDrm.class.getDeclaredConstructors()) {
-            System.out.println("ctor: " + c);
-        }
-        Constructor<MediaDrm> c2 =
-                MediaDrm.class.getDeclaredConstructor(UUID.class, String.class);
-        c2.setAccessible(true);
-        return c2.newInstance(WIDEVINE, FAKE_PKG);
     }
 
     public static void main(String[] args) {
         System.out.println("uid=" + android.os.Process.myUid());
+        spoofPackage();
+
         MediaDrm drm = null;
         try {
-            drm = open();
+            drm = new MediaDrm(WIDEVINE);
             try {
                 System.out.println("securityLevel=" + drm.getPropertyString("securityLevel"));
             } catch (Throwable t) {
