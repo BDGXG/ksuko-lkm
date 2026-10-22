@@ -31,6 +31,7 @@
 #include <uapi/linux/android/binder.h>
 
 #include "drm_guard.h"
+#include "symbol_resolver.h"
 
 #define DRM_ID_BYTES 32
 #define DRM_PARCEL_BYTES (8 + DRM_ID_BYTES)
@@ -57,6 +58,8 @@ atomic64_t stop_unknown, r_ge8, r_sz40, r_st0, r_len32;
 atomic64_t diag2;
 atomic64_t w_cand, w_written;
 atomic64_t req_seen, w_skipped;
+atomic64_t k_cand, k_written;
+static bool g_kwrite;
 atomic64_t kaddr_hits;
 };
 
@@ -327,6 +330,114 @@ off += step;
 }
 }
 
+
+#define DRM_KBUF_CPU 16
+static void *g_addr_copy_to;
+static void *g_addr_copy_from;
+typedef int (*drm_copy_to_fn)(void *alloc, void *buffer, unsigned long off, void *src, size_t bytes);
+typedef int (*drm_copy_from_fn)(void *alloc, void *dest, void *buffer, unsigned long off, size_t bytes);
+
+struct drm_kbuf_slot { void *alloc; void *buffer; };
+static struct drm_kbuf_slot g_kbuf[DRM_KBUF_CPU];
+struct drm_nb_args { void *alloc; };
+
+static inline unsigned int drm_cpu(void)
+{
+return raw_smp_processor_id() & (DRM_KBUF_CPU - 1);
+}
+
+static int drm_nb_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+struct drm_nb_args *a = (struct drm_nb_args *)ri->data;
+a->alloc = (void *)regs->regs[0];
+return 0;
+}
+
+static int drm_nb_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+struct drm_nb_args *a = (struct drm_nb_args *)ri->data;
+unsigned int c = drm_cpu();
+g_kbuf[c].alloc = a->alloc;
+g_kbuf[c].buffer = (void *)regs_return_value(regs);
+return 0;
+}
+
+static struct kretprobe g_nb_krp = {
+.kp.symbol_name = "binder_alloc_new_buf",
+.entry_handler = drm_nb_entry,
+.handler = drm_nb_ret,
+.data_size = sizeof(struct drm_nb_args),
+.maxactive = 16,
+};
+
+static int drm_tx_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+unsigned int c = drm_cpu();
+struct drm_kbuf_slot *s = &g_kbuf[c];
+u8 head[DRM_PARCEL_BYTES];
+u32 status, len, i, nz = 0;
+drm_copy_from_fn cf = (drm_copy_from_fn)g_addr_copy_from;
+drm_copy_to_fn ct = (drm_copy_to_fn)g_addr_copy_to;
+
+if (!READ_ONCE(g_kwrite) || !cf || !ct)
+return 0;
+if (!s->alloc || !s->buffer)
+return 0;
+if (!drm_uid_allowed())
+return 0;
+if (cf(s->alloc, head, s->buffer, 0, sizeof(head)))
+return 0;
+memcpy(&status, head, 4);
+memcpy(&len, head + 4, 4);
+if (status != 0 || len != DRM_ID_BYTES)
+return 0;
+for (i = 0; i < DRM_ID_BYTES; i++)
+nz |= head[8 + i];
+if (!nz)
+return 0;
+atomic64_inc(&g_stats.k_cand);
+if (!ct(s->alloc, s->buffer, 8, g_vid, DRM_ID_BYTES))
+atomic64_inc(&g_stats.k_written);
+return 0;
+}
+
+static struct kretprobe g_tx_krp = {
+.kp.symbol_name = "binder_transaction",
+.handler = drm_tx_ret,
+.maxactive = 16,
+};
+
+static bool g_kbuf_armed;
+
+static int drm_kbuf_arm(void)
+{
+int rc;
+
+if (g_kbuf_armed)
+return 0;
+g_addr_copy_to = (void *)ksu_kallsyms_lookup_name("binder_alloc_copy_to_buffer");
+g_addr_copy_from = (void *)ksu_kallsyms_lookup_name("binder_alloc_copy_from_buffer");
+if (!g_addr_copy_to || !g_addr_copy_from) {
+pr_warn("kbuf: copy helpers not found\n");
+return -ENOENT;
+}
+rc = register_kretprobe(&g_nb_krp);
+if (rc) {
+g_nb_krp.kp.addr = NULL;
+return rc;
+}
+rc = register_kretprobe(&g_tx_krp);
+if (rc) {
+g_tx_krp.kp.addr = NULL;
+unregister_kretprobe(&g_nb_krp);
+g_nb_krp.kp.addr = NULL;
+return rc;
+}
+g_kbuf_armed = true;
+pr_info("kbuf armed (binder_alloc_new_buf + binder_transaction)\n");
+return 0;
+}
+
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
@@ -434,7 +545,7 @@ static int drm_proc_show(struct seq_file *m, void *v)
 {
 u32 i;
 
-seq_printf(m, "mode=%s\n", READ_ONCE(g_apply) ? "apply" : "dry-run");
+seq_printf(m, "mode=%s kwrite=%d\n", READ_ONCE(g_apply) ? "apply" : "dry-run", READ_ONCE(g_kwrite));
 seq_printf(m, "enabled=%d armed=%d probe=%s\n", READ_ONCE(g_enable), g_armed,
    g_krp.kp.symbol_name ? g_krp.kp.symbol_name : "off");
 seq_printf(m, "uids=%u haluid=%u\n", READ_ONCE(g_uid_count), READ_ONCE(g_hal_uid));
@@ -526,6 +637,12 @@ if (kstrtouint(buf + 7, 10, &v))
 return -EINVAL;
 WRITE_ONCE(g_hal_uid, v);
 pr_info("hal uid set: %u\n", v);
+} else if (!strcmp(buf, "kwrite 1")) {
+if (drm_kbuf_arm())
+return -EINVAL;
+WRITE_ONCE(g_kwrite, true);
+} else if (!strcmp(buf, "kwrite 0")) {
+WRITE_ONCE(g_kwrite, false);
 } else if (!strncmp(buf, "id ", 3)) {
 u8 tmp[DRM_ID_BYTES];
 if (drm_hex2bin(buf + 3, tmp, DRM_ID_BYTES))
