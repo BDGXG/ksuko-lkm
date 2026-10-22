@@ -68,6 +68,11 @@ return true;
 return false;
 }
 
+static inline unsigned long drm_untag(unsigned long a)
+{
+return a & 0x00FFFFFFFFFFFFFFUL;
+}
+
 static int drm_u_read(void *dst, const void __user *src, size_t n)
 {
 if (copy_from_user_nofault(dst, src, n)) {
@@ -147,7 +152,7 @@ return 0;
 
 static void drm_scan_read(struct binder_write_read *bwr)
 {
-const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
+const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->read_buffer);
 u32 cap, want, off = 0;
 if (!stream)
 return;
@@ -209,7 +214,7 @@ if (regs_return_value(regs) < 0) {
 atomic64_inc(&g_stats.c_ret);
 return 0;
 }
-if (drm_u_read(&bwr, (void __user *)ctx->arg, sizeof(bwr))) {
+if (drm_u_read(&bwr, (void __user *)drm_untag((unsigned long)ctx->arg), sizeof(bwr))) {
 atomic64_inc(&g_stats.c_bwr);
 return 0;
 }
