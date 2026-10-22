@@ -144,37 +144,31 @@ return 0;
 static void drm_scan_read(struct binder_write_read *bwr)
 {
 const u8 __user *stream = (const u8 __user *)bwr->read_buffer;
-u32 want = min_t(u32, bwr->read_consumed, DRM_SCAN_BYTES);
-u32 off = 0;
-if (!stream || !want)
+u32 cap, want, off = 0;
+if (!stream)
+return;
+cap = min_t(u32, bwr->read_consumed, bwr->read_size);
+want = min_t(u32, cap, DRM_SCAN_BYTES);
+if (!want)
 return;
 atomic64_inc(&g_stats.read_streams);
-if (drm_u_read(buf, stream, want)) {
-if (atomic64_inc_return(&g_stats.diag) <= 3)
-pr_info("scan read fail: rb=%px want=%u consumed=%u size=%u aok=%d
-",
-stream, want, bwr->read_consumed, bwr->read_size,
-access_ok(stream, want) ? 1 : 0);
-return;
-}
 while (off + sizeof(u32) <= want) {
 u32 cmd, step;
 struct binder_transaction_data td;
 if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
-return;
+break;
 step = drm_rec_size(cmd);
 if (!step || off + step > want)
-return;
+break;
 if (cmd == BR_REPLY) {
 if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
-return;
+break;
 atomic64_inc(&g_stats.reply_seen);
 drm_try_patch(&td);
 }
 off += step;
 }
 }
-
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
