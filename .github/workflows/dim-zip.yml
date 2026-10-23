@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-2.0-only
+name: dim-module-zip
+on:
+  push:
+    tags: ['dim-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          set -e
+          test -f dim-module/module.prop
+          for f in dim-module/*.sh dim-module/bin/*.sh dim-module/webroot/cgi-bin/api; do
+            sh -n "$f"
+          done
+
+      - name: Pack zip
+        run: |
+          set -e
+          V=$(sed -n 's/^version=//p' dim-module/module.prop | tr -d '\r')
+          OUT="dim-${V}-arm64.zip"
+          (
+            cd dim-module
+            chmod 0755 *.sh bin/*.sh bin/dim webroot/cgi-bin/api
+            chmod 0644 module.prop config.conf.example README.md \
+                       bin/appicon.py bin/oaid-runtime.jar \
+                       webroot/index.html webroot/app.js
+            # 清掉历史遗留的垃圾 CGI 入口
+            rm -f webroot/cgi-bin/'&1' webroot/cgi-bin/apiHuIXgn 2>/dev/null || true
+            zip -r "../$OUT" . -x '*.bak*' -x '.git*' -x '*.orig' -x '*.rej'
+          )
+          ls -l "$OUT"
+          echo "ASSET=$OUT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dim-module-zip
+          path: dim-*-arm64.zip
+          if-no-files-found: error
+
+      - name: Attach to release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" "$ASSET" --clobber
