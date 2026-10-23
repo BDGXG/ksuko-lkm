@@ -63,6 +63,13 @@ if [ "$(conf_get OAID)" = "rotate" ] && [ -f "$MODDIR/bin/oaid-runtime.jar" ]; t
 fi
 
 
+# 3.5) 应用列表：apps.json 缺失就先用 pm 快列表顶上，图标放后台慢慢生成
+if [ ! -s /data/adb/dim/apps.json ]; then
+  sh "$MODDIR/bin/apps.sh" >/dev/null 2>&1
+  ( sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1 ) &
+  log "apps.json seeded, icons extracting in background"
+fi
+
 # 4) 启动本地 HTTP 面板（单例 + 探活，见 bin/httpd_ctl.sh）
 sh "$MODDIR/bin/httpd_ctl.sh" start
 log "httpd: $(sh "$MODDIR/bin/httpd_ctl.sh" status 2>/dev/null)"

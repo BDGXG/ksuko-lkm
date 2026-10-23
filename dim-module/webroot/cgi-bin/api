@@ -27,6 +27,8 @@ case "$ACT" in
        OUT=$(sh "$DIM" "$ACT" "$VAL") ;;
   apps)  OUT=$(sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1; cat /data/adb/dim/apps.json 2>/dev/null) ;;
   apps-cached) OUT=$(cat /data/adb/dim/apps.json 2>/dev/null) ;;
+  apps-fast)   [ -s /data/adb/dim/apps.json ] || sh "$MODDIR/bin/apps.sh" >/dev/null 2>&1
+               OUT=$(cat /data/adb/dim/apps.json 2>/dev/null) ;;
   *)   OUT='{"ok":false,"error":"unknown action"}' ;;
 esac
 [ -n "$OUT" ] || OUT='{"ok":false,"error":"empty"}'
