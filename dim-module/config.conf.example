@@ -6,6 +6,9 @@
 # 开机自动应用（post-fs-data 会读这个）
 AUTO_APPLY=1
 
+# 总开关（面板不再提供开关，默认开启；置 0 可临时停用）
+MASTER=1
+
 # ---------- Serial ----------
 #   keep    = 沿用上次的值（首次为空）
 #   random  = 生成新的
@@ -29,10 +32,10 @@ DRM=keep
 DRM_UIDS=
 
 #   0 = dry-run（只观察不写），1 = 真正替换
-DRM_APPLY=0
+DRM_APPLY=1
 
 #   开机是否自动下发 DRM
-DRM_AUTO=0
+DRM_AUTO=1
 
 # Widevine HAL 的 uid（通常 1013 = media）
 DRM_HALUID=1013

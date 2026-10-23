@@ -35,6 +35,17 @@ fi
 
 sh "$MODDIR/bin/ko.sh" 2>/dev/null
 
+# 1.5) 原值基线：首次开机就把「当前值」存成原值快照，否则面板只能显示未分配，
+#      直到你手动改一次 ID 才生成备份（这就是「刷完看不到原值」的原因）
+[ -s "$STATE/baseline.json" ] || sh "$MODDIR/bin/dim" baseline-init >/dev/null 2>&1
+[ -s "$STATE/original.json" ]  || printf '{"serial":"%s"}
+' "$(getprop ro.serialno)" > "$STATE/original.json" 2>/dev/null
+if [ ! -f "$BACKUP/ssaid.0.xml" ] && [ -f /data/system/users/0/settings_ssaid.xml ]; then
+  cp -p /data/system/users/0/settings_ssaid.xml "$BACKUP/ssaid.0.xml" 2>/dev/null \
+    && log "ssaid baseline snapshot taken"
+fi
+sh "$MODDIR/bin/dim" ssaid-map >/dev/null 2>&1
+
 # 2) DRM 目标 uid 补齐：安装/迁移后 DRM_UIDS 可能为空，按包名重算一次
 if [ -n "$(conf_get DRM_PKGS)" ] && [ -z "$(conf_get DRM_UIDS)" ]; then
   sh "$MODDIR/bin/dim" drmpkgs "$(conf_get DRM_PKGS)" >/dev/null 2>&1
