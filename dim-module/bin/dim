@@ -414,6 +414,19 @@ drm_restart_hal() {
   [ -n "$p" ] && { kill "$p" 2>/dev/null; log "drm HAL restarted (pid $p)"; }
 }
 # 打开 DRM 钩子：不清 uids 为空（部分版本 sscanf 会拒），改用哨兵 uid 0 + dry-run
+# 硬重载：DRM 改写必须重载一次 ko 才会生效（实测），所以每次改 id 都跑一遍
+drm_reload_core() {
+  rmmod susfs_guard_lkm 2>/dev/null
+  sleep 1
+  sh "$MODDIR/bin/ko.sh" >/dev/null 2>&1
+  sleep 1
+  # 有内核拦截模块时补它的规则（rmmod 会清空 sus_path）
+  [ -f /data/adb/modules/hideguard/susfs_boot.sh ] && \
+    sh /data/adb/modules/hideguard/susfs_boot.sh >/dev/null 2>&1
+  drm_push >/dev/null 2>&1
+  log "drm_reload_core: ko reloaded, config pushed"
+}
+
 drm_off() {
   [ -e "$DRM_PROC" ] || return 0
   echo "apply 0" > "$DRM_PROC" 2>/dev/null
@@ -619,7 +632,7 @@ do_randomize() {
   conf_set SERIAL "$NS"; conf_set DRM "$ND"
   conf_set MASTER 1
   serial_apply "$NS"
-  drm_push
+  drm_reload_core
   for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do ssaid_edit "$u" "*" ""; done
   ssaid_legacy_rotate
   ssaid_build_map
@@ -770,7 +783,7 @@ case "$1" in
                else
                  printf '{"ok":false,"error":"oaid_unavailable","cache_cleared":%s}\n' "${OAID_CLEARED:-0}"
                fi ;;
-  drm)         drm_push
+  drm)         drm_reload_core
                drm_restart_hal; stop_targets   # 关键：重启 HAL + 停应用，否则应用拿缓存值
                echo '{"ok":true}' ;;
   drm-reload)  rmmod susfs_guard_lkm 2>/dev/null; sleep 1
@@ -778,7 +791,7 @@ case "$1" in
                # 有内核拦截模块时把它自己的规则重新下发（rmmod 会清空 sus_path 规则）
                [ -f /data/adb/modules/hideguard/susfs_boot.sh ] && \
                  sh /data/adb/modules/hideguard/susfs_boot.sh >/dev/null 2>&1
-               drm_push >/dev/null 2>&1
+               drm_reload_core
                drm_restart_hal; stop_targets
                log "drm reload: ko reloaded, config re-pushed, hal restarted"
                if [ -e "$DRM_PROC" ]; then echo '{"ok":true}'; else echo '{"ok":false,"error":"node absent"}'; fi ;;
@@ -800,13 +813,13 @@ case "$1" in
   drmid-rand)  ND=$(gen_drmid); cs=$(jget serial < "$STATE/identity.json" 2>/dev/null)
                printf '{"serial":"%s","drmid":"%s"}\n' "$cs" "$ND" > "$STATE/identity.json"
                conf_set DRM "$ND"
-               drm_push >/dev/null 2>&1
+               drm_reload_core
                drm_restart_hal; stop_targets
                log "drmid randomized: $ND"
                printf '{"ok":true,"id":"%s"}\n' "$ND" ;;
   drmid)       printf '{"serial":"","drmid":"%s"}\n' "$2" > "$STATE/identity.json"
                conf_set DRM "$2"
-               drm_push >/dev/null 2>&1
+               drm_reload_core
                drm_restart_hal; stop_targets
                echo '{"ok":true}' ;;
   uids)        echo "uids $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_UIDS "$2"; echo '{"ok":true}' ;;
