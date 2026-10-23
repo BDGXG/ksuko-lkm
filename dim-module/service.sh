@@ -11,7 +11,10 @@ log() { printf '[%s] svc: %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
 conf_get() { sed -n "s/^$1=//p" "$CONF_DIR/config.conf" 2>/dev/null | tail -1; }
 
 until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 2; done
-sleep 6
+sleep 2
+# 先把面板拉起来，后面的基线/DRM 下发即使慢也不影响开面板
+sh "$MODDIR/bin/httpd_ctl.sh" start >/dev/null 2>&1
+sleep 4
 
 # 1) 一次性标记
 [ -f "$STATE/pending_reboot" ] && rm -f "$STATE/pending_reboot" "$STATE/ssaid.target" && log "pending_reboot cleared"
@@ -77,8 +80,9 @@ fi
 # 3.5) 应用列表：apps.json 缺失就先用 pm 快列表顶上，图标放后台慢慢生成
 if [ ! -s /data/adb/dim/apps.json ]; then
   sh "$MODDIR/bin/apps.sh" >/dev/null 2>&1
-  ( nice -n 19 sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1 ) 2>/dev/null &
-  log "apps.json seeded, icons extracting in background"
+  # 图标不在这里生成：proot 提取会占满 IO，导致开机后第一次打开面板卡十几秒。
+  # 面板打开时会自己 kickIcons() 后台补（见 index.html）
+  log "apps.json seeded (icons will be extracted on demand)"
 fi
 
 # 4) 启动本地 HTTP 面板（单例 + 探活，见 bin/httpd_ctl.sh）
