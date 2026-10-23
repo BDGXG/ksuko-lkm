@@ -771,6 +771,14 @@ case "$1" in
                  printf '{"ok":false,"error":"oaid_unavailable","cache_cleared":%s}\n' "${OAID_CLEARED:-0}"
                fi ;;
   drm)         drm_push; echo '{"ok":true}' ;;
+  drm-reload)  rmmod susfs_guard_lkm 2>/dev/null; sleep 1
+               sh "$MODDIR/bin/ko.sh" >/dev/null 2>&1; sleep 1
+               # 有内核拦截模块时把它自己的规则重新下发（rmmod 会清空 sus_path 规则）
+               [ -f /data/adb/modules/hideguard/susfs_boot.sh ] && \
+                 sh /data/adb/modules/hideguard/susfs_boot.sh >/dev/null 2>&1
+               drm_push >/dev/null 2>&1
+               log "drm reload: ko reloaded, config re-pushed"
+               if [ -e "$DRM_PROC" ]; then echo '{"ok":true}'; else echo '{"ok":false,"error":"node absent"}'; fi ;;
   drm-off)     drm_off; echo '{"ok":true}' ;;
   drm-stats)   drm_stats ;;
   opt-stop)    conf_set STOP_AFTER "$2"; echo '{"ok":true}' ;;

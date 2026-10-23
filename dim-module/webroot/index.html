@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2199</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2200</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -949,6 +949,14 @@ function setSerial() {
   if (!/^[0-9A-Fa-f]{16}$/.test(v)) return toast("需要 16 位十六进制");
   confirmDo("写入 Serial", v, "serial", v);
 }
+function drmReload() {
+  toast("正在重载内核模块…");
+  api("drm-reload").then(function (v) {
+    toast(v && v.ok === false ? "重载失败：" + (v.error || "") : "已重载并重新下发");
+    doDrmStats();
+  }).catch(function (e) { toast("重载失败：" + e.message); });
+}
+
 function drmRepush() {
   api("drm").then(function (v) {
     toast(v && v.ok === false ? "下发失败" : "已重新下发");
@@ -987,7 +995,8 @@ function cardTools(k) {
     '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +
     '<div class="ihead"><div class="chips" id="drmChips"></div></div>' +
     '<div class="hint" id="drmStat">内核状态：—</div>' +
-    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:8px" onclick="drmRepush()">重新下发到内核</button></div>';
+    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:8px" onclick="drmRepush()">重新下发到内核</button>' +
+    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:6px" onclick="drmReload()">重载内核模块</button></div>';
 }
 // 应用小卡：只显示 图标 + 应用名（不显示包名）
 // 只显示应用图标的大号 chip（点一下移除）
