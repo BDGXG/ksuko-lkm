@@ -91,3 +91,57 @@ rmmod susfs_guard_lkm
 ```
 
 若开机阶段崩溃：在模块目录放一个空的 `disable` 文件即可阻止开机自动加载（`rmmod` 后亦可）。
+
+---
+
+## 8. 重要修正（2026-10-23 晚实测）
+
+前面 5.1 把“写入失败”全部归因于缺页，这个结论**不完整**。补充实测：
+
+### 8.1 真正生效的是 HAL 侧 write-buffer 路径
+
+`drm_guard` 有两条扫描路径：
+
+| 路径 | 触发点 | 写入对象 | 实测结果 |
+|---|---|---|---|
+| 客户端 | `drm_ret_handler` 扫 read buffer 里的 BR_REPLY | 应用侧 parcel | ❌ `copy_to_user_nofault`\\`copy_to_user`\\`copy_to_kernel_nofault` 全部失败 |
+| **HAL** | `drm_entry_handler` 中 `current_uid == haluid`，扫 write buffer 里的 BC_REPLY | **HAL 自己的 parcel** | ✅ 稳定成功（`w_cand=1 w_written=1`） |
+
+成功时的计数形态：
+
+```
+req_seen=11  e_scan=125  e_gate=1  e_write=92
+w_cand=1  w_written=1  written=1
+```
+
+### 8.2 HAL 路径有 2 秒时间窗
+
+```c
+if (!(g_apply && pend && !time_after(jiffies, pend + 2 * HZ)))
+        atomic64_inc(&e_gate);   // 窗口过期 → 丢弃
+```
+
+`pend` 由请求侧匹配（`code==11` + `deviceUniqueId`）时写入。若请求没被匹配到（`req_seen=0`），
+HAL 路径就永远被 gate 掉。实测把窗口放宽到 60 秒（分支 `win60`）可显著提高命中率。
+
+### 8.3 mediadrm 缓存才是“改了不生效”的主因
+
+`mediadrm` 会缓存 `deviceUniqueId`，**不重启 Widevine HAL 就不会重新问 HAL**，
+钩子自然扫不到任何东西（表现为 `req_seen=0`、`w_cand=0`，看起来像“写入坏了”）。
+
+正确操作顺序：
+
+```sh
+echo 'id <64hex>' > /proc/susfs_drm_guard   # 下发新值
+echo 'uids <目标uid>' > /proc/susfs_drm_guard
+kill $(pidof android.hardware.drm-service.widevine)   # 关键：重启 HAL
+# 重开目标应用，或让它重新发起 DRM 查询
+```
+
+已验证：`kill` 后 HAL 由 init 自动拉起（pid 变化），应用再查即拿到新值。
+
+### 8.4 结论排序
+
+1. 改完 id 必须重启 Widevine HAL（否则一切无效）
+2. 有效写入路径是 HAL write-buffer，不是客户端 read buffer
+3. 客户端路径的三种写方式都不可用，不用再在这个方向尝试
