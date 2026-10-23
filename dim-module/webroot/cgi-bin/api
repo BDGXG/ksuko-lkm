@@ -23,7 +23,7 @@ VAL=$(urldecode "$VAL")
 case "$ACT" in
   status|apply|randomize|restore|log|drm-info|drm-off|drm|drm-stats|setmaster|serial-restore|drmid-rand|oaid|appset|baseline)
        OUT=$(sh "$DIM" "$ACT") ;;
-  serial|ssaid|drmid|uids|haluid|conf|opt-stop|opt-qimei|opt-drmstop|ssaidpkgs|drmpkgs)
+  serial|ssaid|drmid|uids|haluid|conf|opt-stop|opt-qimei|opt-drmstop|ssaidpkgs|drmpkgs|ssaid-restore)
        OUT=$(sh "$DIM" "$ACT" "$VAL") ;;
   apps)  OUT=$(sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1; cat /data/adb/dim/apps.json 2>/dev/null) ;;
   apps-cached) OUT=$(cat /data/adb/dim/apps.json 2>/dev/null) ;;

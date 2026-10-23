@@ -211,12 +211,19 @@ ssaid_edit() {
       { print }' "$wf" > "$wf.tmp" && mv -f "$wf.tmp" "$wf"
   fi
 
-  # 校验：条目数不变 + 旧值不再出现
+  # 校验：条目数不变 + 目标值确实落地
+  #   * 模式：所有旧值都不能再出现（全量轮换）
+  #   单应用模式：只看这个包的 value 是否等于 new；别的应用本来就该保持原样
   c2=$(grep -c '<setting ' "$wf" 2>/dev/null)
   bad=0
-  for ov in $oldvals; do
-    grep -qF "value=\"$ov\"" "$wf" 2>/dev/null && bad=1
-  done
+  if [ "$pkg" = "*" ]; then
+    for ov in $oldvals; do
+      grep -qF "value=\"$ov\"" "$wf" 2>/dev/null && bad=1
+    done
+  else
+    now=$(grep -F "package=\"$pkg\"" "$wf" 2>/dev/null | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)
+    [ "$now" = "$new" ] || bad=1
+  fi
   if [ "$c1" != "$c2" ] || [ $bad -ne 0 ]; then
     log "ssaid: replace failed user=$u pkg=$pkg (settings $c1/$c2 stale=$bad)"
     [ $abx -eq 1 ] && rm -f "$wf"
@@ -228,9 +235,14 @@ ssaid_edit() {
        && /system/bin/abx2xml "$f.abx" "$wf.chk" 2>>"$LOG" \
        && [ "$(grep -c '<setting ' "$wf.chk" 2>/dev/null)" = "$c1" ]; then
       okc=1
-      for ov in $oldvals; do
-        grep -qF "value=\"$ov\"" "$wf.chk" 2>/dev/null && okc=0
-      done
+      if [ "$pkg" = "*" ]; then
+        for ov in $oldvals; do
+          grep -qF "value=\"$ov\"" "$wf.chk" 2>/dev/null && okc=0
+        done
+      else
+        now=$(grep -F "package=\"$pkg\"" "$wf.chk" 2>/dev/null | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)
+        [ "$now" = "$new" ] || okc=0
+      fi
       if [ $okc -eq 1 ]; then
         mv -f "$f.abx" "$f"
       else
@@ -578,6 +590,30 @@ do_randomize() {
   do_status
 }
 
+# 单个应用还原：从首次备份里取出这个包的原始 SSAID 写回
+ssaid_restore_pkg() {
+  pkg="$1"
+  [ -n "$pkg" ] || { printf '{"ok":false,"error":"pkg required"}\n'; return 1; }
+  ok=0; miss=0; fail=0; last=""
+  for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do
+    b="$BACKUP/ssaid.$u.xml"
+    if [ ! -f "$b" ]; then miss=$((miss+1)); continue; fi
+    src="$b"
+    if [ "$(head -c 3 "$b" 2>/dev/null)" = "ABX" ]; then
+      /system/bin/abx2xml "$b" "$b.r" 2>>"$LOG" && src="$b.r"
+    fi
+    ov=$(grep -F "package=\"$pkg\"" "$src" 2>/dev/null | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)
+    rm -f "$b.r"
+    if [ -z "$ov" ]; then miss=$((miss+1)); continue; fi
+    last="$ov"
+    if ssaid_edit "$u" "$pkg" "$ov"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+  done
+  [ $ok -gt 0 ] && ssaid_build_map
+  [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
+  printf '{"ok":true,"ok_users":%d,"missing":%d,"failed":%d,"value":"%s","reboot_required":%s}\n' \
+    "$ok" "$miss" "$fail" "$last" "$([ $ok -gt 0 ] && echo true || echo false)"
+}
+
 do_ssaid() {
   users="$2"
   if [ -z "$users" ] || [ "$users" = "all" ]; then
@@ -587,6 +623,7 @@ do_ssaid() {
   for u in $users; do
     if ssaid_edit "$u" "${1:-*}" ""; then ok=$((ok+1)); else fail=$((fail+1)); fi
   done
+  [ $ok -gt 0 ] && ssaid_build_map
   [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
   printf '{"ok":true,"ok_users":%d,"failed_users":%d,"reboot_required":%s}\n' \
     "$ok" "$fail" "$([ $ok -gt 0 ] && echo true || echo false)"
@@ -667,6 +704,7 @@ case "$1" in
                  "$(jget drmid < "$STATE/identity.json" 2>/dev/null)" > "$STATE/identity.json"
                do_status ;;
   ssaid)       do_ssaid "$2" "${3:-all}" ;;
+  ssaid-restore) ssaid_restore_pkg "$2" ;;
   appset)      appset_reset; echo '{"ok":true}' ;;
   oaid)        oaid_rotate; echo '{"ok":true}' ;;
   drm)         drm_push; echo '{"ok":true}' ;;
