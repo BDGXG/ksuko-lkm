@@ -102,6 +102,8 @@ return -EFAULT;
 return 0;
 }
 
+static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td);
+
 static bool drm_try_patch(struct binder_transaction_data *td)
 {
 void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
@@ -200,7 +202,8 @@ atomic64_inc(&g_stats.r_ge8);
 if (td.data_size == 40)
 atomic64_inc(&g_stats.r_sz40);
 atomic64_inc(&g_stats.reply_seen);
-drm_try_patch(&td);
+if (!drm_try_patch(&td))
+                drm_patch_write_parcel_loose(&td);
 }
 off += step;
 }
