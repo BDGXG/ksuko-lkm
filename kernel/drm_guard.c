@@ -368,7 +368,7 @@ if (READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)) {
 struct binder_write_read wb;
 unsigned long pend = READ_ONCE(g_pending);
 atomic64_inc(&g_stats.e_scan);
-if (!(READ_ONCE(g_apply) && pend && !time_after(jiffies, pend + 2 * HZ)))
+if (!(READ_ONCE(g_apply) && pend && !time_after(jiffies, pend + 60 * HZ)))
 atomic64_inc(&g_stats.e_gate);
 else if (!drm_u_read(&wb, (void __user *)drm_untag((unsigned long)regs->regs[2]), sizeof(wb)) &&
 wb.write_size && wb.write_buffer) {
@@ -407,7 +407,7 @@ return 0;
 }
 if (g_hal_uid && __kuid_val(current_uid()) == g_hal_uid) {
 unsigned long pend = READ_ONCE(g_pending);
-if (!pend || time_after(jiffies, pend + 2 * HZ)) {
+if (!pend || time_after(jiffies, pend + 60 * HZ)) {
 atomic64_inc(&g_stats.w_skipped);
 return 0;
 }
@@ -499,6 +499,7 @@ seq_printf(m, "reply ge8=%lld sz40=%lld st0=%lld len32=%lld stop_unknown=%lld\n"
 atomic64_read(&g_stats.r_ge8), atomic64_read(&g_stats.r_sz40),
 atomic64_read(&g_stats.r_st0), atomic64_read(&g_stats.r_len32),
 atomic64_read(&g_stats.stop_unknown));
+seq_printf(m, "e_scan=%lld e_gate=%lld e_write=%lld\n", atomic64_read(&g_stats.e_scan), atomic64_read(&g_stats.e_gate), atomic64_read(&g_stats.e_write));
 seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
    atomic64_read(&g_stats.c_cmd), atomic64_read(&g_stats.c_ret),
    atomic64_read(&g_stats.c_arg), atomic64_read(&g_stats.c_bwr),
