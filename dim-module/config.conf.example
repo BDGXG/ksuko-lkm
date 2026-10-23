@@ -1,0 +1,53 @@
+#==================================================
+#        设备标识管理 · 配置
+#  改完执行: sh /data/adb/modules/dim/bin/dim apply
+#==================================================
+
+# 开机自动应用（post-fs-data 会读这个）
+AUTO_APPLY=1
+
+# ---------- Serial ----------
+#   keep    = 沿用上次的值（首次为空）
+#   random  = 生成新的
+#   <值>    = 固定用这个（16 位 hex，大写）
+SERIAL=random
+
+# ---------- Android ID (SSAID) ----------
+#   keep / random
+ANDROID_ID=keep
+
+# ---------- OAID ----------
+#   keep / rotate
+OAID=keep
+
+# ---------- DRM ID（Widevine deviceUniqueId，32 字节 hex）----------
+#   keep / random / <64 位 hex>
+DRM=keep
+
+# ---------- DRM 生效范围 ----------
+#   留空 = 全局；填 uid 用逗号分隔，例如 10424,10429
+DRM_UIDS=
+
+#   0 = dry-run（只观察不写），1 = 真正替换
+DRM_APPLY=0
+
+#   开机是否自动下发 DRM
+DRM_AUTO=0
+
+# Widevine HAL 的 uid（通常 1013 = media）
+DRM_HALUID=1013
+
+# 面板端口（浏览器访问 http://127.0.0.1:16667/）
+HTTP_PORT=16667
+
+# ---------- 进阶开关（一般不用改）----------
+# 一键更换后是否 force-stop 目标应用（让它冷启动读到新值）
+STOP_AFTER=1
+# 一键更换后是否清掉目标应用的 QIMEI 缓存
+#   =1：同时重置腾讯设备 ID（推荐；改 ID 时旧 QIMEI 会把设备重新认出来）
+#   =0：保留 QIMEI（服务端会看到“同一设备换了 ID”，也是异常信号）
+CLEAR_QIMEI=1
+# 改 DRM ID 后是否 force-stop 生效应用（关掉则玩游戏中改值不会被踢下线）
+DRM_STOP=1
+# 目标应用（按包名，换设备也能用）
+DRM_PKGS=
