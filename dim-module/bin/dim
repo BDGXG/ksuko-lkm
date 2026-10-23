@@ -590,23 +590,31 @@ do_randomize() {
   do_status
 }
 
-# 单个应用还原：从首次备份里取出这个包的原始 SSAID 写回
+# 还原：支持单个包、逗号分隔多个包、* 整体还原
 ssaid_restore_pkg() {
-  pkg="$1"
-  [ -n "$pkg" ] || { printf '{"ok":false,"error":"pkg required"}\n'; return 1; }
+  pkgs="$1"
+  [ -n "$pkgs" ] || { printf '{"ok":false,"error":"pkg required"}\n'; return 1; }
   ok=0; miss=0; fail=0; last=""
   for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do
     b="$BACKUP/ssaid.$u.xml"
+    f="/data/system/users/$u/settings_ssaid.xml"
     if [ ! -f "$b" ]; then miss=$((miss+1)); continue; fi
+    if [ "$pkgs" = "*" ]; then
+      # 整体还原：直接用首次备份覆盖
+      if cp -f "$b" "$f"; then fix_meta "$f"; ok=$((ok+1)); else fail=$((fail+1)); fi
+      continue
+    fi
     src="$b"
     if [ "$(head -c 3 "$b" 2>/dev/null)" = "ABX" ]; then
       /system/bin/abx2xml "$b" "$b.r" 2>>"$LOG" && src="$b.r"
     fi
-    ov=$(grep -F "package=\"$pkg\"" "$src" 2>/dev/null | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)
+    for pk in $(printf '%s' "$pkgs" | tr ',' ' '); do
+      ov=$(grep -F "package=\"$pk\"" "$src" 2>/dev/null | sed -n 's/.*value="\([^"]*\)".*/\1/p' | head -1)
+      if [ -z "$ov" ]; then miss=$((miss+1)); continue; fi
+      last="$ov"
+      if ssaid_edit "$u" "$pk" "$ov"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    done
     rm -f "$b.r"
-    if [ -z "$ov" ]; then miss=$((miss+1)); continue; fi
-    last="$ov"
-    if ssaid_edit "$u" "$pkg" "$ov"; then ok=$((ok+1)); else fail=$((fail+1)); fi
   done
   [ $ok -gt 0 ] && ssaid_build_map
   [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
@@ -615,13 +623,16 @@ ssaid_restore_pkg() {
 }
 
 do_ssaid() {
+  pkgs="$1"; [ -n "$pkgs" ] || pkgs="*"
   users="$2"
   if [ -z "$users" ] || [ "$users" = "all" ]; then
     users=$(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$')
   fi
   ok=0; fail=0
   for u in $users; do
-    if ssaid_edit "$u" "${1:-*}" ""; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    for pk in $(printf '%s' "$pkgs" | tr ',' ' '); do
+      if ssaid_edit "$u" "$pk" ""; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    done
   done
   [ $ok -gt 0 ] && ssaid_build_map
   [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
