@@ -16,6 +16,22 @@
 | Root 方案 | **KernelSU**（依赖 `ksud`、`resetprop`）。Magisk 未适配 |
 | 架构 | arm64（aarch64） |
 | Android | 11 及以上（依赖 `abx2xml` / `xml2abx` 处理 ColorOS 的 ABX 格式；普通 XML 也能处理） |
+
+### 内核兼容性
+
+| 内核 | KMI | 对应 ko 文件名 |
+|---|---|---|
+| 6.6（Android 15） | `android15-6.6` | `ko/android15-6.6.ko` 或 `ko/6.6.ko` |
+| 6.12（Android 16） | `android16-6.12` | `ko/android16-6.12.ko` 或 `ko/6.12.ko` |
+
+`bin/ko.sh` 会按 `uname -r` 推出 KMI，再校验 ko 里的 `vermagic=`：
+内核版本号与 `android<X>` 标签都要对得上才会 insmod，否则跳过并在日志里说明
+（避免把 6.6 的 ko 塞进 6.12 的内核）。
+
+用户态部分（Serial / SSAID / OAID / 面板）与内核版本无关，两个内核通用。
+6.12 起 LSM 改为 per-hook 静态调用、`security_hook_list` 去掉 hlist 节点，
+这部分由内核模块的 `>= 6.12` 分支处理，需要单独编译对应的 ko。
+
 | DRM ID | 需要配套内核模块 `susfs_guard_lkm`（见本仓库 `kernel/`），提供 `/proc/susfs_drm_guard`。**没有它时该功能会显示「未就绪」，其余功能不受影响** |
 | OAID | 仅 ColorOS / OxygenOS 等含 `com.heytap.openid` 服务的 ROM。其他 ROM 上 OAID 只能读缓存、不能轮换，按钮会提示不可用 |
 | 应用图标 | 需要 proot 环境里的 python + PIL + aapt。没有时列表仍可用，图标退化为首字母占位 |

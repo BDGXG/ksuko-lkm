@@ -518,6 +518,19 @@ do_status() {
   printf '"device":{"brand":"%s","model":"%s","serial":"%s","fingerprint":"%s"},' \
     "$(esc "$(getprop ro.product.brand)")" "$(esc "$(getprop ro.product.model)")" \
     "$(esc "$c_ser")" "$(esc "$(getprop ro.build.fingerprint)")"
+  # 内核信息：版本、是否已加载、ko 目录里有哪些文件（6.6 / 6.12 多 KMI 排查用）
+  _krel=$(uname -r)
+  _kl=""; _kfirst=1
+  for _f in "$MODDIR/ko"/*.ko; do
+    [ -f "$_f" ] || continue
+    [ "$_kfirst" = "1" ] || _kl="$_kl,"
+    _kl="$_kl\"$(esc "$(basename "$_f")")\""
+    _kfirst=0
+  done
+  printf '"kernel":{"release":"%s","kmiver":"%s","loaded":%s,"node":%s,"ko":[%s]},' \
+    "$(esc "$_krel")" "$(printf '%s' "$_krel" | cut -d. -f1,2)" \
+    "$([ -d /sys/module/susfs_guard_lkm ] && echo true || echo false)" \
+    "$([ -e "$DRM_PROC" ] && echo true || echo false)" "$_kl"
   printf '"identities":{'
   printf '"serial":%s,' "$(st_item "$(baseline_get serial)" "$c_ser" "$t_ser")"
   printf '"soc_serial":%s,' "$(st_item "$(baseline_get soc_serial)" "$c_soc" "")"
@@ -788,5 +801,7 @@ case "$1" in
   baseline)    cat "$STATE/baseline.json" 2>/dev/null || echo '{}' ;;
   conf)        if [ -n "$3" ]; then conf_set "$2" "$3"; echo '{"ok":true}'; else conf_get "$2"; fi ;;
   log)         printf '{"ok":true,"log":"%s"}\n' "$(esc "$(tail -n 200 "$LOG" 2>/dev/null)")" ;;
+  ko)          sh "$MODDIR/bin/ko.sh" ;;
+  ko-check)    sh "$MODDIR/bin/ko.sh" check ;;
   *)           echo '{"ok":false,"error":"unknown action"}'; exit 2 ;;
 esac

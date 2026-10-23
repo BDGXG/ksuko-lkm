@@ -46,6 +46,7 @@ jobs:
       matrix:
         variant:
           - android15-6.6
+          - android16-6.12
     container:
       # DDK-min image with the GKI kernel headers (modules_prepare done), Module.symvers and the matching Clang toolchain:
       # KMI freezing guarantees symbol CRCs match the GKI kernel of that release.

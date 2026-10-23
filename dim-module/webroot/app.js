@@ -1,7 +1,7 @@
 "use strict";
 const API = ["http://127.0.0.1:16667/cgi-bin/api", "/cgi-bin/api"];
 const $ = id => document.getElementById(id);
-let pending = null, pickMode = "ssaid", apps = [], appMap = {}, appsByPkg = {}, targets = [], rest = {};
+let pending = null, pickMode = "ssaid", apps = [], appMap = {}, appsByPkg = {}, targets = [], rest = {}, kern = {};
 
 const toast = t => {
   const e = $("toast"); e.textContent = t; e.classList.add("show");
@@ -65,6 +65,7 @@ async function doStatus() {
   await loadApps();
 
   const de = d.device || {}, drm = d.drm || {}, ids = d.identities || {}, cfg = d.config || {};
+  kern = d.kernel || {};
   const surf = {};
   (d.surfaces || []).forEach(s => { if (s && s.id) surf[s.id] = s; });
 
@@ -452,9 +453,10 @@ async function doDrmStats() {
   const el = $("drmStat");
   try {
     const d = JSON.parse(await api("drm-stats"));
-    if (!d.ok) { if (el) el.textContent = "内核状态：节点不存在（ko 未加载）"; return; }
+    const kp = kern && kern.release ? ("内核 " + String(kern.release).split("-")[0] + " · ") : "";
+    if (!d.ok) { if (el) el.textContent = kp + "节点不存在（内核模块未加载）"; return; }
     const on = d.enabled === "1" && d.mode === "apply";
-    if (el) el.textContent = "内核：" + (on ? "生效中" : "未生效") + " · " + d.mode +
+    if (el) el.textContent = kp + "内核：" + (on ? "生效中" : "未生效") + " · " + d.mode +
       " · armed=" + d.armed + " · 命中 " + d.exact_hits + " · 写入 " + d.written + " · 失败 " + d.nofault_fail;
   } catch (e) {
     if (el) el.textContent = "内核状态：读取失败";
