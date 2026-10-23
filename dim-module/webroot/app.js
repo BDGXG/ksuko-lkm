@@ -53,7 +53,13 @@ async function loadApps(force) {
 
 async function doStatus() {
   let s;
-  try { s = await api("status"); } catch (e) { toast("后台未响应"); return; }
+  try { s = await api("status"); }
+  catch (e) {
+    toast("后台未响应");
+    const d = $("devline");
+    if (d) d.textContent = "后台未响应：" + e.message + "（127.0.0.1:16667）";
+    return;
+  }
   let d;
   try { d = JSON.parse(s); } catch (e) { return; }
   await loadApps();
