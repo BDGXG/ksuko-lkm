@@ -2,6 +2,11 @@ name: lvpatch
 
 # 在 x86_64 runner 上用 apktool 重打包「我是绿玩」，并签名
 on:
+  push:
+    branches: [drm-m15]
+    paths:
+      - ".github/workflows/lvpatch.yml"
+      - "tools/lvpatch/**"
   workflow_dispatch:
 
 permissions:
