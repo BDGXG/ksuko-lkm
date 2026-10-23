@@ -316,7 +316,7 @@ async function applyDrmId() {
 }
 
 // 卡片右上角的「生成 / 清除」支持矩阵与动作映射
-const SUPPORT = { serial: ["gen", "clr"], androidid: ["gen"], oaid: ["gen"], drmid: ["gen", "clr"] };
+const SUPPORT = { serial: ["gen", "clr"], androidid: ["gen", "clr"], oaid: ["gen"], drmid: ["gen", "clr"] };
 function cardTools(k) {
   if (k === "serial") return '<div class="cdtools">' +
     '<details class="mini"><summary>手动写入指定序列号</summary>' +
@@ -326,7 +326,7 @@ function cardTools(k) {
     '</details></div>';
   if (k === "androidid") return '<div class="cdtools">' +
     '<div class="pkglist" id="pkgChip"></div>' +
-    '<div class="hint" style="margin-top:8px">选好后点右上角「随机」；没选则重置全部。改完需重启才生效。</div></div>';
+    '<div class="hint" style="margin-top:8px">右上角「随机 / 还原」作用于已选应用；一个都没选则对全部应用生效。改完需重启。</div></div>';
   if (k === "oaid") return '<div class="cdtools">' +
     '<div class="hint" style="margin:0">本机 OAID 由系统服务下发，只能轮换、不能指定值；轮换后应用要重新查询才看得到。</div></div>';
   if (k === "drmid") return '<div class="cdtools">' +
@@ -420,11 +420,14 @@ function cardAct(k, kind) {
   if (k === "serial" && kind === "gen") return confirmDo("随机序列号", "按原值的长度与大小写随机生成并应用", "serial", "random");
   if (k === "serial" && kind === "clr") return confirmDo("还原序列号", "把序列号写回首次备份的真值", "serial-restore");
   if (k === "androidid" && kind === "gen") {
-    if (ssaidPkgs.length === 1)
-      return confirmDo("随机安卓 ID", "只重置 " + ssaidPkgs[0] + "，需重启生效", "ssaid", ssaidPkgs[0]);
-    if (ssaidPkgs.length > 1)
-      return confirmDo("随机安卓 ID", "重置选中的 " + ssaidPkgs.length + " 个应用，需重启生效", "__ssaid_multi__", ssaidPkgs.join(","));
+    if (ssaidPkgs.length)
+      return confirmDo("随机安卓 ID", "重置选中的 " + ssaidPkgs.length + " 个应用，需重启生效", "ssaid", ssaidPkgs.join(","));
     return confirmDo("随机安卓 ID（全部应用）", "将重置所有应用的安卓 ID，需重启生效", "ssaid", "*");
+  }
+  if (k === "androidid" && kind === "clr") {
+    if (ssaidPkgs.length)
+      return confirmDo("还原安卓 ID", "把选中的 " + ssaidPkgs.length + " 个应用写回首次备份的原值，需重启生效", "ssaid-restore", ssaidPkgs.join(","));
+    return confirmDo("还原安卓 ID（全部应用）", "用首次备份整体还原所有应用的安卓 ID，需重启生效", "ssaid-restore", "*");
   }
   if (k === "oaid" && kind === "gen") return confirmDo("随机广告标识", "调用 OPLUS 接口轮换广告标识（面板显示的是缓存值）", "oaid");
   if (k === "drmid" && kind === "gen") return confirmDo("随机 DRM ID", "生成新的 64 位虚拟 ID 并立即下发", "drmid-rand");
