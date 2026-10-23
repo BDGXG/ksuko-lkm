@@ -433,18 +433,17 @@ ssaid_build_map() {
   f=/data/system/users/0/settings_ssaid.xml
   if [ -f "$f" ]; then
     src="$f"
-    if [ "$(head -c 3 "$f" 2>\/dev\/null)" = "ABX" ]; then
-      /system/bin/abx2xml "$f" "$f.sm" 2>\/dev\/null && src="$f.sm"
+    if [ "$(head -c 3 "$f" 2>/dev/null)" = "ABX" ]; then
+      /system/bin/abx2xml "$f" "$f.sm" 2>/dev/null && src="$f.sm"
     fi
-    [ -f "$src" ] && sed -n 's/.*name="[0-9][0-9]*" value="[^"]*".*/&/p' "$src" 2>\/dev\/null >/dev/null
     [ -f "$src" ] && sed -n 's/.*name="\([0-9][0-9]*\)" value="\([^"]*\)".*/\1 \2/p' "$src" > "$_c"
     rm -f "$f.sm"
   fi
   b="$BACKUP/ssaid.0.xml"
   if [ -f "$b" ]; then
     osrc="$b"
-    if [ "$(head -c 3 "$b" 2>\/dev\/null)" = "ABX" ]; then
-      /system/bin/abx2xml "$b" "$b.sm" 2>\/dev\/null && osrc="$b.sm"
+    if [ "$(head -c 3 "$b" 2>/dev/null)" = "ABX" ]; then
+      /system/bin/abx2xml "$b" "$b.sm" 2>/dev/null && osrc="$b.sm"
     fi
     [ -f "$osrc" ] && sed -n 's/.*name="\([0-9][0-9]*\)" value="\([^"]*\)".*/\1 \2/p' "$osrc" > "$_o"
     rm -f "$b.sm"
@@ -452,7 +451,7 @@ ssaid_build_map() {
   [ -s "$_c" ] || return 1
   awk 'FNR==NR{cur[$1]=$2;next}{ori[$1]=$2}END{for(u in cur) print u"\t"(ori[u]?ori[u]:"")"\t"cur[u]}' "$_c" "$_o" > "$_m"
   rm -f "$_c" "$_o"
-  log "ssaid map built: $(wc -l < "$_m" 2>\/dev\/null) entries"
+  log "ssaid map built: $(wc -l < "$_m" 2>/dev/null) entries"
 }
 # ---------- 状态 ----------
 st_item() {
@@ -526,7 +525,7 @@ do_status() {
   _first=1
   for _pkg in $(conf_get SSAID_PKGS | tr ',' ' '); do
     _uid=$(uid_of_pkg "$_pkg"); [ -n "$_uid" ] || continue
-    _line=$(grep -m1 "^$_uid	" "$STATE/ssaid_map.tsv" 2>\/dev\/null)
+    _line=$(grep -m1 "^$_uid	" "$STATE/ssaid_map.tsv" 2>/dev/null)
     _oval=""; _cval=""
     if [ -n "$_line" ]; then
       _cval=${_line##*	}
@@ -658,7 +657,7 @@ do_ssaid() {
   done
   [ $ok -gt 0 ] && ssaid_build_map
   [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
-  printf '{"ok":true,"ok_users":%d,"failed_users":%d,"reboot_required":%s}\n' \
+  printf '{"ok":true,"ok":%d,"failed":%d,"reboot_required":%s}\n' \
     "$ok" "$fail" "$([ $ok -gt 0 ] && echo true || echo false)"
 }
 
@@ -704,6 +703,9 @@ do_restore() {
   [ -f "$BACKUP/app_set_ids.xml" ] && cp -f "$BACKUP/app_set_ids.xml" /data/system/app_set_ids.xml && fix_meta /data/system/app_set_ids.xml
   [ -f "$BACKUP/oaid_persistence_0" ] && cp -f "$BACKUP/oaid_persistence_0" /data/system/oaid_persistence_0 && fix_meta /data/system/oaid_persistence_0
   rm -f "$STATE/identity.json"
+  # 状态文件一起清：否则重启前面板仍按旧样本显示虚拟值，看着像没还原
+  rm -f "$STATE/ssaid.current" "$STATE/ssaid.target" "$STATE/ssaid_map.tsv" \
+        "$STATE/status.cache" "$STATE/pending_reboot"
   # 只复位总开关状态；config 里的目标值保留，方便「重新开启」时按原配置再次应用
   conf_set MASTER 0
   sk=""
@@ -772,7 +774,7 @@ case "$1" in
                echo '{"ok":true}' ;;
   uids)        echo "uids $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_UIDS "$2"; echo '{"ok":true}' ;;
   haluid)      echo "haluid $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_HALUID "$2"; echo '{"ok":true}' ;;
-  restore)     do_restore ;;
+  restore|restore-all) do_restore ;;
   setmaster)   if [ "$2" = "1" ]; then do_apply; else do_restore; fi ;;
   baseline)    cat "$STATE/baseline.json" 2>/dev/null || echo '{}' ;;
   conf)        if [ -n "$3" ]; then conf_set "$2" "$3"; echo '{"ok":true}'; else conf_get "$2"; fi ;;
