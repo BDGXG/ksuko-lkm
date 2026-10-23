@@ -10,7 +10,10 @@ const toast = t => {
   clearTimeout(window.__t); window.__t = setTimeout(() => e.classList.remove("show"), 1800);
 };
 const esc = s => String(s == null ? '' : s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/["']/g, function (c) {
+    return ['&', c === '"' ? 'quot' : '#39', ';'].join('');
+  });
 
 // 从可能的脏输出中截取 JSON（后端偶有 native 工具把结果打到 stdout）
 function pickJson(t) {
