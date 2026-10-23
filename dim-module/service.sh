@@ -18,6 +18,7 @@ sleep 6
 
 # 2) 刷新 Android ID 当前值样本（面板按应用 SSAID 显示，而不是 legacy 值）
 _ssaid_f=/data/system/users/0/settings_ssaid.xml
+_ssaid_src=""
 if [ -f "$_ssaid_f" ]; then
   if [ "$(head -c 3 "$_ssaid_f" 2>/dev/null)" = "ABX" ]; then
     /system/bin/abx2xml "$_ssaid_f" /data/local/tmp/.sc.xml 2>/dev/null && _ssaid_src=/data/local/tmp/.sc.xml
@@ -27,7 +28,7 @@ if [ -f "$_ssaid_f" ]; then
   if [ -n "$_ssaid_src" ]; then
     sed -n 's/.*name="[0-9][0-9]*" value="\([^"]*\)".*/\1/p' "$_ssaid_src" 2>/dev/null | head -1 > "$STATE/ssaid.current"
     log "ssaid.current refreshed: $(cat "$STATE/ssaid.current" 2>/dev/null)"
-sh "$MODDIR/bin/dim" ssaid-map >/dev/null 2>&1
+    sh "$MODDIR/bin/dim" ssaid-map >/dev/null 2>&1
   fi
   rm -f /data/local/tmp/.sc.xml
 fi
