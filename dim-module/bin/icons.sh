@@ -7,6 +7,8 @@ LIST=/data/local/tmp/.dim_list.tsv
 PR=/data/user/0/com.ai.assistance.operit/files/usr/bin/proot
 RB=$(dirname "$PR")/../var/lib/proot-distro/installed-rootfs/ubuntu
 
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+
 mkdir -p "$OUT" "$OUTD/icons" "$M/webroot/icons" 2>/dev/null
 find "$OUTD/icons" -name '*.png' -delete 2>/dev/null
 find "$M/webroot/icons" -name '*.png' -delete 2>/dev/null
@@ -51,7 +53,7 @@ for p in $(awk -F'\t' '{print $1}' "$LIST" 2>/dev/null); do
   [ -n "$lab" ] || lab="$p"
   ic=0; [ -f "$M/webroot/icons/$p.png" ] && ic=1
   [ $first -eq 1 ] || printf ',' >> "$OUT/apps.json.tmp"
-  printf '{"pkg":"%s","label":"%s","uid":%s,"icon":%s}' "$p" "$lab" "$u" "$ic" >> "$OUT/apps.json.tmp"
+  printf '{"pkg":"%s","label":"%s","uid":%s,"icon":%s}' "$(esc "$p")" "$(esc "$lab")" "$u" "$ic" >> "$OUT/apps.json.tmp"
   first=0
 done
 printf ']' >> "$OUT/apps.json.tmp"

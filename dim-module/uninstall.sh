@@ -4,8 +4,11 @@
 MODDIR=${0%/*}
 
 if [ -x "$MODDIR/bin/dim" ]; then
-  sh "$MODDIR/bin/dim" restore-all
-  echo "dim: restore-all executed" 
+  out=$(sh "$MODDIR/bin/dim" restore-all 2>&1)
+  case "$out" in
+    *'"ok":true'*) echo "dim: restore-all ok" ;;
+    *)             echo "dim: restore-all FAILED: $out" ;;
+  esac
 fi
 
 # 兜底：万一 restore-all 没跑到，至少把 Serial 和 DRM 关掉
