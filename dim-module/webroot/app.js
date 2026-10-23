@@ -99,8 +99,8 @@ async function doStatus() {
       '</div>';
     return '<div class="idcard">' +
       '<div class="ihd"><b>' + n + '</b>' + badge + cg + nr + rb + act + '</div>' +
-      row('原值', orig) +
-      row('当前', cur) +
+      (k === "androidid" ? ''
+        : (k === "oaid" ? row('当前', cur) : row('原值', orig) + row('当前', cur))) +
       cardTools(k) +
       '</div>';
   }).join("");
@@ -108,6 +108,8 @@ async function doStatus() {
   targets = String(drm.pkgs || "").split(",").filter(Boolean);
   renderTargets();
   renderDrmChips();
+  ssaidPkgs = String(cfg.ssaid_pkgs || "").split(",").filter(Boolean);
+  ssaidMap = d.ssaid_map || [];
   renderPkgChips();
   if (drm.virtual_id) $("in-drm").value = drm.virtual_id;
 
@@ -132,6 +134,7 @@ async function doStatus() {
 
 function renderTargets() {
   const box = $("targets");
+  if (!box) return;                 // 02 区的「作用于」列表已移除，这里直接跳过
   if (!targets.length) {
     box.innerHTML = '<div class="line"><span class="v" style="text-align:left">全部应用（未限定）</span></div>';
     if ($("tgtcount")) $("tgtcount").textContent = "全部应用";
@@ -263,6 +266,7 @@ function applyPicker() {
   } else {
     ssaidPkgs = Array.from(pickSel.pkg);
     renderPkgChips();
+    api("ssaidpkgs", ssaidPkgs.join(",")).catch(function(){});
     toast("已选 " + ssaidPkgs.length + " 个应用");
   }
   closePicker();
@@ -307,7 +311,7 @@ function cardTools(k) {
     '<button class="btn btn-gray btn-sm btn-full" onclick="setSerial()">写入序列号</button>' +
     '</details></div>';
   if (k === "androidid") return '<div class="cdtools">' +
-    '<div class="ihead"><div class="chips" id="pkgChip"></div></div>' +
+    '<div class="pkglist" id="pkgChip"></div>' +
     '<div class="hint" style="margin-top:8px">选好后点右上角「随机」；没选则重置全部。改完需重启才生效。</div></div>';
   if (k === "oaid") return '<div class="cdtools">' +
     '<div class="hint" style="margin:0">本机 OAID 由系统服务下发，只能轮换、不能指定值；轮换后应用要重新查询才看得到。</div></div>';
@@ -315,7 +319,6 @@ function cardTools(k) {
     '<div class="field"><label>虚拟 ID（64 位十六进制，改完自动下发）</label>' +
     '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +
     '<div class="ihead"><div class="chips" id="drmChips"></div></div>' +
-    '<div class="orow"><span>改完停掉生效应用</span><label class="sw"><input type="checkbox" id="optDrmStop" onchange="toggleOpt(\'drmstop\',this)"><i></i></label></div>' +
     '<div class="hint" id="drmStat">内核状态：—</div></div>';
 }
 // 应用小卡：只显示 图标 + 应用名（不显示包名）
@@ -350,18 +353,38 @@ function renderDrmChips() {
 
 // 安卓 ID 选中的应用列表（内存态；空 = 全部）
 let ssaidPkgs = [];
+let ssaidMap = [];
 
 function renderPkgChips() {
   const box = $("pkgChip"); if (!box) return;
-  box.innerHTML = ssaidPkgs.map(function (p) {
-    const a = (apps || []).filter(function (x) { return x.pkg === p; })[0];
-    return iconChip(a, p, "rmSsaidPkg('" + p + "')");
-  }).join("") + addBtn("ssaid");
+  let html = "";
+  ssaidPkgs.forEach(function (p) {
+    const a = appsByPkg[p];
+    const label = a ? (a.label || a.pkg) : p;
+    const m = (ssaidMap || []).filter(function (x) { return x.pkg === p; })[0] || {};
+    const ic = a && a.icon
+      ? '<img src="icons/' + a.pkg + '.png" onerror="this.style.display=\'none\'">'
+      : '<span class="noic">' + esc(label.charAt(0)) + '</span>';
+    const rowv = function (k, v, cls) {
+      const t = v || "未分配";
+      return '<div class="pkgl"><span class="k">' + k + '</span>' +
+        '<span class="v ' + (cls || '') + '">' + esc(t) + '</span>' +
+        (v ? '<button class="copybtn" data-v="' + esc(v) + '" onclick="copy(this.dataset.v)">复制</button>' : '') +
+        '</div>';
+    };
+    html += '<div class="pkgrow">' +
+      '<div class="pkghd">' + ic + '<b>' + esc(label) + '</b>' +
+      '<i data-p="' + esc(p) + '" onclick="rmSsaidPkg(this.dataset.p)">×</i></div>' +
+      rowv("原值", m.orig) + rowv("当前", m.cur, "cur") +
+      '</div>';
+  });
+  box.innerHTML = html + addBtn("ssaid");
 }
 
 function rmSsaidPkg(p) {
   ssaidPkgs = ssaidPkgs.filter(function (x) { return x !== p; });
   renderPkgChips();
+  api("ssaidpkgs", ssaidPkgs.join(",")).catch(function(){});
 }
 
 function rmDrmTarget(uid) {

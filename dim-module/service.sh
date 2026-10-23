@@ -27,6 +27,7 @@ if [ -f "$_ssaid_f" ]; then
   if [ -n "$_ssaid_src" ]; then
     sed -n 's/.*name="[0-9][0-9]*" value="\([^"]*\)".*/\1/p' "$_ssaid_src" 2>/dev/null | head -1 > "$STATE/ssaid.current"
     log "ssaid.current refreshed: $(cat "$STATE/ssaid.current" 2>/dev/null)"
+sh "$MODDIR/bin/dim" ssaid-map >/dev/null 2>&1
   fi
   rm -f /data/local/tmp/.sc.xml
 fi

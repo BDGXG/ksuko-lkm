@@ -391,6 +391,35 @@ drm_stats() {
     "$(drm_uids_list)" "$(st calls)" "$(st exact_hits)" "$(st written)" "$(st nofault_fail)" "$(st w_cand)" "$(st w_written)"
 }
 
+# 生成 uid -> (原值, 当前值) 映射，供面板按应用展示 SSAID
+ssaid_build_map() {
+  _m="$STATE/ssaid_map.tsv"
+  _c=/data/local/tmp/.sm_cur; _o=/data/local/tmp/.sm_ori
+  rm -f "$_c" "$_o"
+  f=/data/system/users/0/settings_ssaid.xml
+  if [ -f "$f" ]; then
+    src="$f"
+    if [ "$(head -c 3 "$f" 2>\/dev\/null)" = "ABX" ]; then
+      /system/bin/abx2xml "$f" "$f.sm" 2>\/dev\/null && src="$f.sm"
+    fi
+    [ -f "$src" ] && sed -n 's/.*name="[0-9][0-9]*" value="[^"]*".*/&/p' "$src" 2>\/dev\/null >/dev/null
+    [ -f "$src" ] && sed -n 's/.*name="\([0-9][0-9]*\)" value="\([^"]*\)".*/\1 \2/p' "$src" > "$_c"
+    rm -f "$f.sm"
+  fi
+  b="$BACKUP/ssaid.0.xml"
+  if [ -f "$b" ]; then
+    osrc="$b"
+    if [ "$(head -c 3 "$b" 2>\/dev\/null)" = "ABX" ]; then
+      /system/bin/abx2xml "$b" "$b.sm" 2>\/dev\/null && osrc="$b.sm"
+    fi
+    [ -f "$osrc" ] && sed -n 's/.*name="\([0-9][0-9]*\)" value="\([^"]*\)".*/\1 \2/p' "$osrc" > "$_o"
+    rm -f "$b.sm"
+  fi
+  [ -s "$_c" ] || return 1
+  awk 'FNR==NR{cur[$1]=$2;next}{ori[$1]=$2}END{for(u in cur) print u"\t"(ori[u]?ori[u]:"")"\t"cur[u]}' "$_c" "$_o" > "$_m"
+  rm -f "$_c" "$_o"
+  log "ssaid map built: $(wc -l < "$_m" 2>\/dev\/null) entries"
+}
 # ---------- 状态 ----------
 st_item() {
   o="$1"; c="$2"; t="$3"
@@ -446,8 +475,8 @@ do_status() {
   printf '{"ok":true,'
   mst=$(conf_get MASTER)
   [ -n "$mst" ] || mst=$([ "$(conf_get DRM_APPLY)" = "1" ] && echo 1 || echo 0)
-  printf '"config":{"schema":3,"master_enabled":%s,"drm_apply":"%s","stop_after":"%s","clear_qimei":"%s","drm_stop":"%s"},' \
-    "$([ "$mst" = "1" ] && echo true || echo false)" "$(conf_get DRM_APPLY)" "$(conf_get STOP_AFTER)" "$(conf_get CLEAR_QIMEI)" "$(conf_get DRM_STOP)"
+  printf '"config":{"schema":3,"master_enabled":%s,"drm_apply":"%s","stop_after":"%s","clear_qimei":"%s","drm_stop":"%s","ssaid_pkgs":"%s"},' \
+    "$([ "$mst" = "1" ] && echo true || echo false)" "$(conf_get DRM_APPLY)" "$(conf_get STOP_AFTER)" "$(conf_get CLEAR_QIMEI)" "$(conf_get DRM_STOP)" "$(esc "$(conf_get SSAID_PKGS)")"
   printf '"device":{"brand":"%s","model":"%s","serial":"%s","fingerprint":"%s"},' \
     "$(esc "$(getprop ro.product.brand)")" "$(esc "$(getprop ro.product.model)")" \
     "$(esc "$c_ser")" "$(esc "$(getprop ro.build.fingerprint)")"
@@ -458,6 +487,22 @@ do_status() {
   printf '"oaid":%s,' "$(st_item "$b_oaid_show" "$c_oaid" "$(head -1 "$STATE/oaid.current" 2>/dev/null)")"
   printf '"drmid":%s' "$(st_item "$(baseline_get drmid)" "$drm_id" "$t_drm")"
   printf '},'
+  # 按应用列出 SSAID 原值/当前值（供安卓 ID 卡片分行展示）
+  printf '"ssaid_map":['
+  _first=1
+  for _pkg in $(conf_get SSAID_PKGS | tr ',' ' '); do
+    _uid=$(uid_of_pkg "$_pkg"); [ -n "$_uid" ] || continue
+    _line=$(grep -m1 "^$_uid	" "$STATE/ssaid_map.tsv" 2>\/dev\/null)
+    _oval=""; _cval=""
+    if [ -n "$_line" ]; then
+      _cval=${_line##*	}
+      _oval=${_line#*	}; _oval=${_oval%%	*}
+    fi
+    [ "$_first" = "1" ] || printf ','
+    _first=0
+    printf '{"pkg":"%s","uid":"%s","orig":"%s","cur":"%s"}' "$(esc "$_pkg")" "$_uid" "$(esc "$_oval")" "$(esc "$_cval")"
+  done
+  printf '],'
   printf '"drm":{"node":%s,"mode":"%s","enabled":"%s","armed":"%s","haluid":"%s","pkgs":"%s","virtual_id":"%s"},' \
     "$([ -e "$DRM_PROC" ] && echo true || echo false)" \
     "$(esc "$drm_mode")" "$(esc "$drm_en")" "$(esc "$drm_arm")" "$(esc "$drm_hal")" \
@@ -523,6 +568,7 @@ do_randomize() {
   drm_push
   for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do ssaid_edit "$u" "*" ""; done
   ssaid_legacy_rotate
+  ssaid_build_map
   oaid_rotate
   appset_reset
   echo 1 > "$STATE/pending_reboot"
@@ -629,6 +675,8 @@ case "$1" in
   opt-stop)    conf_set STOP_AFTER "$2"; echo '{"ok":true}' ;;
   opt-qimei)   conf_set CLEAR_QIMEI "$2"; echo '{"ok":true}' ;;
   opt-drmstop) conf_set DRM_STOP "$2"; echo '{"ok":true}' ;;
+  ssaidpkgs)   conf_set SSAID_PKGS "$2"; echo '{"ok":true}' ;;
+  ssaid-map)   ssaid_build_map; echo '{"ok":true}' ;;
   drmpkgs)     conf_set DRM_PKGS "$2"; ru=$(resolve_uids)
                conf_set DRM_UIDS "$ru"
                echo "uids ${ru:-0}" > "$DRM_PROC" 2>/dev/null
@@ -641,13 +689,13 @@ case "$1" in
                printf '{"serial":"%s","drmid":"%s"}\n' "$cs" "$ND" > "$STATE/identity.json"
                conf_set DRM "$ND"
                drm_push >/dev/null 2>&1
-               drm_restart_hal; [ "$(conf_get DRM_STOP)" = "1" ] && stop_pkgs
+               drm_restart_hal; stop_targets
                log "drmid randomized: $ND"
                printf '{"ok":true,"id":"%s"}\n' "$ND" ;;
   drmid)       printf '{"serial":"","drmid":"%s"}\n' "$2" > "$STATE/identity.json"
                conf_set DRM "$2"
                drm_push >/dev/null 2>&1
-               drm_restart_hal; [ "$(conf_get DRM_STOP)" = "1" ] && stop_pkgs
+               drm_restart_hal; stop_targets
                echo '{"ok":true}' ;;
   uids)        echo "uids $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_UIDS "$2"; echo '{"ok":true}' ;;
   haluid)      echo "haluid $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_HALUID "$2"; echo '{"ok":true}' ;;

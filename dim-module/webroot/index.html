@@ -201,7 +201,19 @@
   details.mini[open]>summary:before{transform:rotate(90deg)}
   .ihead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:32px}
   .ihead .chips{flex:0 1 auto}
-  .appico{display:inline-flex;width:32px;height:32px;border-radius:9px;overflow:hidden;cursor:pointer;
+  .pkglist{display:block}
+  .pkgrow{display:block;padding:10px 0;border-bottom:1px solid var(--line)}
+  .pkgrow:last-of-type{border-bottom:0}
+  .pkghd{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .pkghd img,.pkghd .noic{width:26px;height:26px;border-radius:7px;flex:0 0 auto;object-fit:cover}
+  .pkghd .noic{display:grid;place-items:center;background:var(--line);color:var(--muted);font-size:11px;font-weight:700}
+  .pkghd b{flex:1;min-width:0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pkghd i{font-style:normal;color:var(--subtle);cursor:pointer;font-size:15px;flex:0 0 auto}
+  .pkgl{display:flex;align-items:center;gap:8px;padding:2px 0 2px 34px}
+  .pkgl .k{flex:0 0 34px;font-size:10.5px;color:var(--subtle)}
+  .pkgl .v{flex:1;min-width:0;font-family:var(--mono);font-size:11px;color:var(--muted);word-break:break-all}
+  .pkgl .v.cur{color:var(--text)}
+  .pkgl .copybtn{padding:2px 7px;font-size:9.5px}
     border:1px solid var(--line);background:var(--surface)}
   .appico img{width:100%;height:100%;object-fit:cover}
   .appico .noic{width:100%;height:100%;display:grid;place-items:center;background:var(--line);
@@ -416,7 +428,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-1960</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2055</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -481,7 +493,25 @@
 
   <section class="section-block">
     <div class="section-heading">
-      <div><span class="section-index">01</span><div><h2>当前状态</h2><p>模块是否生效，以及每一项的原值 / 当前值。</p></div></div>
+      <div><span class="section-index">01</span><div><h2>一键更换</h2><p>点一下就把全部标识换新；重启后安卓 ID 才生效。</p></div></div>
+    </div>
+    <div class="card">
+      <div class="card-bd">
+        <button class="btn btn-primary btn-full" onclick="confirmDo('一键更换','为已选应用生成全新的一套标识：\nSerial / Android ID / OAID / DRM ID，并重置 AppSetID。\nAndroid ID 与 OAID 需重启生效。','randomize')">一键更换全部标识</button>
+        <div class="hint">会覆盖当前虚拟值。想撤销就去「高级设置 → 恢复原样」。</div>
+      </div>
+      <div class="grp">
+        <div class="opt" style="border-top:0;padding-top:0"><div class="mt"><b>换完停掉目标应用</b><s>让它下次冷启动才读到新标识</s></div>
+          <label class="sw"><input type="checkbox" id="optStop" onchange="toggleOpt('stop',this)"><i></i></label></div>
+        <div class="opt"><div class="mt"><b>同时清 QIMEI 缓存</b><s>会重置腾讯设备 ID，慎用</s></div>
+          <label class="sw"><input type="checkbox" id="optQimei" onchange="toggleOpt('qimei',this)"><i></i></label></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-block">
+    <div class="section-heading">
+      <div><span class="section-index">02</span><div><h2>当前状态</h2><p>模块是否生效，以及每一项的原值 / 当前值。</p></div></div>
     </div>
     <div class="card">
       <div class="master">
@@ -490,28 +520,6 @@
       </div>
       <div id="list"></div>
       <div class="card-ft"><div class="hint" style="margin:0">原值 = 首次备份的真值 · 当前 = 系统正在使用的值 · 徽章显示是否已写入</div></div>
-    </div>
-  </section>
-
-  <section class="section-block">
-    <div class="section-heading">
-      <div><span class="section-index">02</span><div><h2>一键更换</h2><p>新手只做这一步：选应用 → 点按钮 → 重启。</p></div></div>
-    </div>
-    <div class="card">
-      <div class="card-bd">
-        <button class="btn btn-primary btn-full" onclick="confirmDo('一键更换','为已选应用生成全新的一套标识：\nSerial / Android ID / OAID / DRM ID，并重置 AppSetID。\nAndroid ID 与 OAID 需重启生效。','randomize')">一键更换全部标识</button>
-        <div class="hint">会覆盖当前虚拟值。想撤销就去「高级设置 → 恢复原样」。</div>
-      </div>
-      <div class="grp">
-        <div class="grp-head"><b>作用于</b><span class="cur" id="tgtcount">全部应用</span></div>
-        <div id="targets"></div>
-      </div>
-      <div class="grp">
-        <div class="opt" style="border-top:0;padding-top:0"><div class="mt"><b>换完停掉目标应用</b><s>让它下次冷启动才读到新标识</s></div>
-          <label class="sw"><input type="checkbox" id="optStop" onchange="toggleOpt('stop',this)"><i></i></label></div>
-        <div class="opt"><div class="mt"><b>同时清 QIMEI 缓存</b><s>会重置腾讯设备 ID，慎用</s></div>
-          <label class="sw"><input type="checkbox" id="optQimei" onchange="toggleOpt('qimei',this)"><i></i></label></div>
-      </div>
     </div>
   </section>
 
@@ -586,6 +594,6 @@ try {
   }
 } catch (e) {}
 </script>
-<script src="app.js?v=20261023-1985"></script>
+<script src="app.js?v=20261023-2055"></script>
 </body>
 </html>
