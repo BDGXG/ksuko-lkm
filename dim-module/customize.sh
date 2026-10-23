@@ -43,6 +43,14 @@ else
   ui_print "  ! 本机没有 com.heytap.openid，OAID 轮换将不可用"
 fi
 
+# 内核模块：只提示不阻断（只影响 DRM，Serial/SSAID/OAID 用不到它）
+KMM_I=$(uname -r 2>/dev/null | cut -d. -f1,2)
+if [ -n "$KMM_I" ] && [ -f "$MODPATH/ko/$KMM_I.ko" ]; then
+  ui_print "  内核模块 ko/$KMM_I.ko   OK"
+else
+  ui_print "  ! 没有 ko/${KMM_I:-未知}.ko，DRM ID 功能不可用（其余功能正常）"
+fi
+
 # 默认目标应用：三角洲行动。只有本机真的装了才设为默认
 CFG=/data/adb/dim/config.conf
 DEFPKG=""
