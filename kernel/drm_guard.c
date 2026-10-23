@@ -268,6 +268,51 @@ atomic64_inc(&g_stats.written);
 return true;
 }
 
+/*
+ * 宽松匹配：有些 HAL（含 DevCheck 读 deviceUniqueId 的那条链路）会把
+ * [status=0][len=32][32B id] 嵌在更长的 parcel 里，或者 data_size 不是
+ * 正好 40，于是严格判定永远不命中。这里在 data_size（上限 4KB）内按字节
+ * 滑动找这个 8+32 字节结构，命中后原地改写。
+ * 只在 g_apply=1 且 uid 已通过 drm_uid_allowed() 时才会被调用。
+ */
+static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td)
+{
+    void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
+    u8 head[DRM_PARCEL_BYTES];
+    u32 status, len, i, nz;
+    size_t total, pos;
+
+    if (!parcel || td->offsets_size || td->data_size < (size_t)DRM_PARCEL_BYTES)
+        return false;
+
+    total = min_t(size_t, td->data_size, (size_t)DRM_SCAN_BYTES);
+    for (pos = 0; pos + (size_t)DRM_PARCEL_BYTES <= total; pos++) {
+        if (drm_u_read(head, (u8 __user *)parcel + pos, sizeof(head)))
+            return false;
+        memcpy(&status, head, 4);
+        memcpy(&len, head + 4, 4);
+        if (status != 0 || len != DRM_ID_BYTES)
+            continue;
+        nz = 0;
+        for (i = 0; i < DRM_ID_BYTES; i++)
+            nz |= head[8 + i];
+        if (!nz)
+            continue;
+
+        atomic64_inc(&g_stats.w_cand);
+        if (!READ_ONCE(g_apply)) {
+            atomic64_inc(&g_stats.would_write);
+            return false;
+        }
+        if (drm_u_write((u8 __user *)parcel + pos + 8, g_vid, DRM_ID_BYTES))
+            return false;
+        atomic64_inc(&g_stats.w_written);
+        atomic64_inc(&g_stats.written);
+        return true;
+    }
+    return false;
+}
+
 static void drm_scan_write(struct binder_write_read *bwr)
 {
 const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
@@ -290,7 +335,8 @@ break;
 if (cmd == BC_REPLY) {
 if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
 break;
-drm_patch_write_parcel(&td);
+if (!drm_patch_write_parcel(&td))
+            drm_patch_write_parcel_loose(&td);
 }
 off += step;
 }
