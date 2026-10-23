@@ -209,6 +209,8 @@
   .pkghd .noic{display:grid;place-items:center;background:var(--line);color:var(--muted);font-size:11px;font-weight:700}
   .pkghd b{flex:1;min-width:0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pkghd i{font-style:normal;color:var(--subtle);cursor:pointer;font-size:15px;flex:0 0 auto}
+  .pkgact{display:flex;gap:6px;flex:0 0 auto}
+  .pkgact .hdbtn{padding:3px 9px;font-size:11px;border-radius:8px}
   .pkgl{display:flex;align-items:center;gap:8px;padding:2px 0 2px 34px}
   .pkgl .k{flex:0 0 34px;font-size:10.5px;color:var(--subtle)}
   .pkgl .v{flex:1;min-width:0;font-family:var(--mono);font-size:11px;color:var(--muted);word-break:break-all}
@@ -429,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2100</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2110</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -595,6 +597,6 @@ try {
   }
 } catch (e) {}
 </script>
-<script src="app.js?v=20261023-2100"></script>
+<script src="app.js?v=20261023-2110"></script>
 </body>
 </html>

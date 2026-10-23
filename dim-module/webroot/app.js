@@ -388,6 +388,10 @@ function renderPkgChips() {
     };
     html += '<div class="pkgrow">' +
       '<div class="pkghd">' + ic + '<b>' + esc(label) + '</b>' +
+      '<span class="pkgact">' +
+        '<button class="hdbtn" data-p="' + esc(p) + '" onclick="ssaidOne(this.dataset.p,\'gen\')">随机</button>' +
+        '<button class="hdbtn" data-p="' + esc(p) + '" onclick="ssaidOne(this.dataset.p,\'clr\')">还原</button>' +
+      '</span>' +
       '<i data-p="' + esc(p) + '" onclick="rmSsaidPkg(this.dataset.p)">×</i></div>' +
       rowv("原值", m.orig) + rowv("当前", m.cur, "cur") +
       '</div>';
@@ -399,6 +403,12 @@ function rmSsaidPkg(p) {
   ssaidPkgs = ssaidPkgs.filter(function (x) { return x !== p; });
   renderPkgChips();
   api("ssaidpkgs", ssaidPkgs.join(",")).catch(function(){});
+}
+
+function ssaidOne(pkg, kind) {
+  if (kind === "gen")
+    return confirmDo("随机安卓 ID", "只重置 " + pkg + "，需重启生效", "ssaid", pkg);
+  return confirmDo("还原安卓 ID", "把 " + pkg + " 写回首次备份的安卓 ID，需重启生效", "ssaid-restore", pkg);
 }
 
 function rmDrmTarget(uid) {
