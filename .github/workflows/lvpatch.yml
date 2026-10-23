@@ -1,0 +1,50 @@
+name: lvpatch
+
+# 在 x86_64 runner 上用 apktool 重打包「我是绿玩」，并签名
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取 apktool
+        run: |
+          curl -sL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          ls -l apktool.jar
+
+      - name: 解包目录
+        run: |
+          unzip -q tools/lvpatch/dec.zip -d work
+          ls work/dec
+          # apktool.yml 的版本号降到 2.9.x，否则新版 yml 会拒绝
+          sed -i 's/^version: .*/version: 2.9.3/' work/dec/apktool.yml
+          sed -i '/^sdkInfo:/,+3 s/^/ /' work/dec/apktool.yml || true
+
+      - name: 重打包
+        run: |
+          java -jar apktool.jar b work/dec -o unsigned.apk
+          ls -l unsigned.apk
+
+      - name: 签名
+        run: |
+          keytool -genkeypair -keystore ks.jks -storepass android -keypass android \
+            -alias lv -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=lv" >/dev/null 2>&1
+          BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+          echo "build-tools=$BT"
+          "$BT/zipalign" -f 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks ks.jks --ks-pass pass:android --key-pass pass:android \
+            --out lv-signed.apk aligned.apk
+          "$BT/apksigner" verify --print-certs lv-signed.apk | head -5
+          ls -l lv-signed.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lv-signed.apk
+          path: lv-signed.apk
+          if-no-files-found: error
