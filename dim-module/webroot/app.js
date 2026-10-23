@@ -41,8 +41,8 @@ async function api(action, value) {
 
 const IDS = [["serial","序列号"],["androidid","安卓 ID"],["oaid","广告标识"],["drmid","DRM ID"]];
 
-async function loadApps() {
-  if (apps.length) return;
+async function loadApps(force) {
+  if (apps.length && !force) return;
   try {
     const v = JSON.parse(await api("apps-cached"));
     apps = Array.isArray(v) ? v : [];
@@ -235,11 +235,17 @@ async function openPicker(mode) {
   else ssaidPkgs.forEach(p => pickSel.pkg.add(p));
   $("pmask").classList.add("show");
   $("alist").innerHTML = "加载中…";
-  await loadApps();
+  await loadApps(true);          // 打开选择器时重取 apps.json，装/卸应用后不至于显示旧列表
   if (!apps.length) {
     try { apps = JSON.parse(await api("apps")); appMap = {}; apps.forEach(a => { appMap[String(a.uid)] = a; }); } catch (e) {}
   }
   renderPicker();
+}
+
+let pickTimer = null;
+function queueFilter() {
+  clearTimeout(pickTimer);
+  pickTimer = setTimeout(renderPicker, 120);
 }
 
 function renderPicker() {
@@ -249,7 +255,7 @@ function renderPicker() {
   $("alist").innerHTML = list.length ? list.map(a => {
     const sel = pickSel.pkg.has(a.pkg);
     return '<div class="arow" data-pkg="' + a.pkg + '" data-uid="' + a.uid + '" onclick="pick(this.dataset.pkg,this.dataset.uid)">' +
-      (a.icon ? '<img src="icons/' + a.pkg + '.png" onerror="this.style.visibility=\'hidden\'">' : '<img>') +
+      (a.icon ? '<img loading="lazy" decoding="async" src="icons/' + a.pkg + '.png" onerror="this.style.visibility=\'hidden\'">' : '<img>') +
       '<span class="p"><b>' + esc(a.label || a.pkg) + '</b><s>' + a.pkg + '</s></span>' +
       '<span class="ck' + (sel ? " on" : "") + '"></span></div>';
   }).join("") : '<div class="arow">没有匹配</div>';
@@ -279,7 +285,8 @@ async function refreshApps() {
   $("alist").innerHTML = "扫描中，请稍候（约 10~30 秒）…";
   try {
     apps = JSON.parse(await api("apps"));
-    appMap = {}; apps.forEach(a => { appMap[String(a.uid)] = a; });
+    appMap = {}; appsByPkg = {};
+    apps.forEach(a => { if (a && a.pkg) { appMap[String(a.uid)] = a; appsByPkg[a.pkg] = a; } });
     renderPicker();
     toast("已刷新 " + apps.length + " 个");
   } catch (e) { $("alist").innerHTML = "刷新失败"; }
