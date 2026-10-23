@@ -1,6 +1,6 @@
 id=dim
 name=设备标识管理 (KSU)
-version=v1.2.0-2170
-versionCode=12170
+version=v1.2.0-2180
+versionCode=12180
 author=port
 description=Serial / SSAID / AppSetID / OAID / DRM ID 统一管理 · 面板 /data/adb/dim · 内置内核模块
