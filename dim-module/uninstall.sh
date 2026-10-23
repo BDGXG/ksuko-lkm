@@ -38,4 +38,7 @@ else
   echo "dim: cannot write $BK, skip backup"
 fi
 
-rm -rf /data/adb/dim
+# 保留 /data/adb/dim：里面是配置、原值基线（baseline.json / original.json）
+# 和 ssaid 快照。删掉的话下次重装就再也拼不回「原值」了——这正是之前
+# 「原值变成未分配」的根因。真要彻底清理，手动删这个目录即可。
+echo "dim: keep /data/adb/dim (config + baseline + backups)"

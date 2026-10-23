@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2195</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2196</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -517,10 +517,6 @@
       <div><span class="section-index">02</span><div><h2>当前状态</h2><p>模块是否生效，以及每一项的原值 / 当前值。</p></div></div>
     </div>
     <div class="card">
-      <div class="master">
-        <div class="mt"><b>总开关</b><s>关闭会还原可还原项，并停止开机自动应用</s></div>
-        <label class="sw"><input type="checkbox" id="master" onchange="toggleMaster(this)"><i></i></label>
-      </div>
       <div id="list"></div>
       <div class="card-ft"><div class="hint" style="margin:0">原值 = 首次备份的真值 · 当前 = 系统正在使用的值 · 徽章显示是否已写入</div></div>
     </div>
@@ -685,7 +681,7 @@ async function doStatus() {
   $("devline").textContent = (de.brand||"?") + " " + (de.model||"?") + " · " + (de.serial||"");
   const on = !!(drm.node && drm.enabled === "1");
   $("dot").classList.toggle("on", on);
-  $("master").checked = !!cfg.master_enabled;
+  if ($("master")) $("master").checked = !!cfg.master_enabled;   // 总开关已移除
   if ($("optStop")) $("optStop").checked = cfg.stop_after === "1";
   if ($("optQimei")) $("optQimei").checked = cfg.clear_qimei === "1";
   if ($("optDrmStop")) $("optDrmStop").checked = cfg.drm_stop === "1";

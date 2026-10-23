@@ -26,6 +26,13 @@ if [ ! -f /data/adb/dim/config.conf ]; then
   chmod 600 /data/adb/dim/config.conf
 fi
 
+# 总开关：面板已去掉这个开关，老配置缺键时补成 1
+CFG0=/data/adb/dim/config.conf
+if [ -f "$CFG0" ]; then
+  grep -q '^MASTER=' "$CFG0" 2>/dev/null || printf 'MASTER=1
+' >> "$CFG0"
+fi
+
 # 依赖自检：缺什么就明说，别让人装完以为全都能用
 ui_print "- 检查依赖"
 if [ -x /data/adb/ksu/bin/ksud ]; then

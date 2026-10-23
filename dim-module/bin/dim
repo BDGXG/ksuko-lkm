@@ -799,6 +799,7 @@ case "$1" in
   restore|restore-all) do_restore ;;
   setmaster)   if [ "$2" = "1" ]; then do_apply; else do_restore; fi ;;
   baseline)    cat "$STATE/baseline.json" 2>/dev/null || echo '{}' ;;
+  baseline-init) baseline_once; cat "$STATE/baseline.json" 2>/dev/null || echo '{}' ;;
   conf)        if [ -n "$3" ]; then conf_set "$2" "$3"; echo '{"ok":true}'; else conf_get "$2"; fi ;;
   log)         printf '{"ok":true,"log":"%s"}\n' "$(esc "$(tail -n 200 "$LOG" 2>/dev/null)")" ;;
   ko)          sh "$MODDIR/bin/ko.sh" ;;
