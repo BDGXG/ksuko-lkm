@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2202</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2203</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -1153,7 +1153,15 @@ window.onerror = function (m, s, l) {
     if (d) d.textContent = "后台未响应：" + e.message;
     toast("后台未响应");
   });
-})(12);
+})(40);
+
+// 页面切回前台时再试一次（首次打开的常见场景：关掉 KSU 再点开）
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState !== "visible") return;
+  const d = $("devline");
+  if (d && d.textContent && d.textContent.indexOf("后台") === -1) return;
+  doStatus().catch(function () {});
+});
 </script>
 </body>
 </html>
