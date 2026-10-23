@@ -329,6 +329,34 @@ off += step;
 }
 
 
+
+static void drm_scan_write_entry(struct binder_write_read *bwr)
+{
+const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
+u32 cap, off = 0;
+
+if (!stream)
+return;
+cap = min_t(u32, bwr->write_size, DRM_SCAN_BYTES);
+if (!cap)
+return;
+while (off + sizeof(u32) <= cap) {
+u32 cmd, step;
+struct binder_transaction_data td;
+if (drm_u_read(&cmd, stream + off, sizeof(cmd)))
+break;
+step = drm_bc_size(cmd);
+if (!step || off + step > cap)
+break;
+if (cmd == BC_REPLY) {
+if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
+break;
+drm_patch_write_parcel(&td);
+}
+off += step;
+}
+}
+
 static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
