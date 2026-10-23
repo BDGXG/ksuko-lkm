@@ -24,3 +24,11 @@
 
 ### Docs
 - 新增 `docs/dim-integration.md`：节点命令集、配置键、生效判据（`written>0`）、禁止项（`haluid 0`、`enable 0`）、故障对照表。
+
+### Investigated
+- **OAID**：实测确认为明文——系统应用 `com.heytap.openid` 通过 Binder 返回
+  **UTF-16LE 的 64 个十六进制字符**（140 字节 parcel）。已实现内核侧匹配与等长替换
+  （分支 `oaid-apply`，节点命令 `oaid <64hex>` / `oapply 1`），但**写入未成功**，
+  原因与 `deviceUniqueId` 早期症状一致（目标页未驻留）。细节见 `docs/oaid-notes.md`。
+- 探针（`pstr 1`）可在 GKI 内核上定位 binder 回包中的字符串，注意
+  `print_hex_dump_bytes()` 不可用，需用 `pr_info` 拼 ASCII。
