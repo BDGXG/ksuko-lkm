@@ -101,7 +101,7 @@ async function doStatus() {
     const row = (label, v, cls) =>
       '<div class="irow"><span class="k">' + label + '</span>' +
       '<span class="v ' + (cls || '') + '">' +
-        (v ? esc(v) : (k === 'oaid' && label === '原值' ? '—（本机无法获取）' : '—')) + '</span>' +
+        (v ? esc(v) : (k === 'oaid' && label === '原值' ? '—（系统未持久化，无真值）' : '—')) + '</span>' +
       (v ? '<button class="copybtn" data-v="' + esc(v) + '" onclick="copy(this.dataset.v)">复制</button>' : '<span class="copybtn ghost"></span>') +
       '</div>';
     return '<div class="idcard">' +
@@ -328,7 +328,8 @@ function cardTools(k) {
     '<div class="pkglist" id="pkgChip"></div>' +
     '<div class="hint" style="margin-top:8px">右上角「随机 / 还原」作用于已选应用；一个都没选则对全部应用生效。改完需重启。</div></div>';
   if (k === "oaid") return '<div class="cdtools">' +
-    '<div class="hint" style="margin:0">本机 OAID 由系统服务下发，只能轮换、不能指定值；轮换后应用要重新查询才看得到。</div></div>';
+    '<div class="hint" style="margin:0">本机 OAID 由 com.heytap.openid 运行时下发，磁盘上没有真值，所以只能轮换、不能指定值，也无法还原。' +
+    '<br>轮换后会自动停掉并清理目标应用的 OAID 缓存（umeng / 穿山甲），应用下次冷启动才会拿到新值。</div></div>';
   if (k === "drmid") return '<div class="cdtools">' +
     '<div class="field"><label>虚拟 ID（64 位十六进制，改完自动下发）</label>' +
     '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +

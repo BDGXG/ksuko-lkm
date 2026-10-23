@@ -353,7 +353,29 @@ oaid_rotate() {
     printf '%s\n' "$ov" > "$STATE/oaid.current"
     log "oaid rotated -> $ov"
   fi
-  log "oaid rotate"
+  OAID_CLEARED=$(oaid_cache_clear)
+  log "oaid rotate (cache cleared: $OAID_CLEARED pkg)"
+}
+
+# 轮换后清掉目标应用的 OAID 缓存。
+# ColorOS 上 OAID 由 com.heytap.openid 运行时下发，没有落盘真值；
+# 各应用（尤其穿山甲/友盟 SDK）第一次查到后会自己缓存一份，
+# 不清缓存的话应用会一直用手里那份旧值，看起来像「换了没生效」。
+oaid_cache_clear() {
+  _n=0
+  _pkgs=$(printf '%s,%s' "$(conf_get SSAID_PKGS)" "$(conf_get DRM_PKGS)" \
+    | tr ',' '\n' | sed '/^$/d' | sort -u)
+  for _p in $_pkgs; do
+    [ -d "/data/data/$_p" ] || continue
+    _hit=$(find "/data/data/$_p/shared_prefs" -maxdepth 1 \
+      \( -iname 'umeng_sp_oaid.xml' -o -iname '*device_register_oaid_refine.xml' \) 2>/dev/null)
+    [ -n "$_hit" ] || continue
+    am force-stop "$_p" 2>/dev/null
+    printf '%s\n' "$_hit" | while read -r _f; do rm -f "$_f"; done
+    _n=$((_n+1))
+    log "oaid cache cleared: $_p"
+  done
+  printf '%s' "$_n"
 }
 
 # ---------- DRM ----------
@@ -717,7 +739,9 @@ case "$1" in
   ssaid)       do_ssaid "$2" "${3:-all}" ;;
   ssaid-restore) ssaid_restore_pkg "$2" ;;
   appset)      appset_reset; echo '{"ok":true}' ;;
-  oaid)        oaid_rotate; echo '{"ok":true}' ;;
+  oaid)        oaid_rotate
+               printf '{"ok":true,"oaid":"%s","cache_cleared":%s}\n' \
+                 "$(head -1 "$STATE/oaid.current" 2>/dev/null)" "${OAID_CLEARED:-0}" ;;
   drm)         drm_push; echo '{"ok":true}' ;;
   drm-off)     drm_off; echo '{"ok":true}' ;;
   drm-stats)   drm_stats ;;
