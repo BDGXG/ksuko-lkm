@@ -1,8 +1,6 @@
 "use strict";
 const API = ["http://127.0.0.1:16667/cgi-bin/api", "/cgi-bin/api"];
 const $ = id => document.getElementById(id);
-// 启动探针：确认脚本真的被执行（排查“一直检测中”）
-try { var _dl = document.getElementById("devline"); if (_dl) _dl.textContent = "JS 已加载 build-1970"; } catch (e) {}
 let pending = null, pickMode = "ssaid", apps = [], appMap = {}, appsByPkg = {}, targets = [], rest = {};
 
 const toast = t => {
@@ -448,8 +446,6 @@ window.onerror = function (m, s, l) {
   try {
     var t = document.getElementById("statusText");
     if (t) t.textContent = "ERR";
-    var d = document.getElementById("devline");
-    if (d) d.textContent = "错误：" + m + " @" + l;
     var pill = document.getElementById("statusPill");
     if (pill) pill.classList.remove("ok");
   } catch (e) {}
