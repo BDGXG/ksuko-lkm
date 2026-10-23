@@ -35,6 +35,12 @@ fi
 
 sh "$MODDIR/bin/ko.sh" 2>/dev/null
 
+# 2) DRM 目标 uid 补齐：安装/迁移后 DRM_UIDS 可能为空，按包名重算一次
+if [ -n "$(conf_get DRM_PKGS)" ] && [ -z "$(conf_get DRM_UIDS)" ]; then
+  sh "$MODDIR/bin/dim" drmpkgs "$(conf_get DRM_PKGS)" >/dev/null 2>&1
+  log "drm uids resolved from pkgs: $(conf_get DRM_UIDS)"
+fi
+
 # 2) DRM 下发（hideguard 的内核节点）
 if [ -e "$DRM_PROC" ] && [ "$(conf_get DRM_AUTO)" = "1" ]; then
   id=$(sed -n 's/.*"drmid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE/identity.json" 2>/dev/null | head -1)

@@ -19,6 +19,18 @@ if [ ! -f /data/adb/dim/config.conf ]; then
   chmod 600 /data/adb/dim/config.conf
 fi
 
+# 默认目标应用：三角洲行动（只补空值，不动用户已有配置）
+CFG=/data/adb/dim/config.conf
+DEFPKG=com.tencent.tmgp.dfm
+for k in SSAID_PKGS DRM_PKGS; do
+  if grep -q "^$k=" "$CFG" 2>/dev/null; then
+    [ -n "$(sed -n "s/^$k=//p" "$CFG" 2>/dev/null | tail -1)" ] \
+      || sed -i "s|^$k=.*|$k=$DEFPKG|" "$CFG"
+  else
+    printf '%s=%s\n' "$k" "$DEFPKG" >> "$CFG"
+  fi
+done
+
 # 首次记录原始 Serial
 if [ ! -f /data/adb/dim/state/original.json ]; then
   printf '{"serial":"%s"}\n' "$(getprop ro.serialno)" > /data/adb/dim/state/original.json
