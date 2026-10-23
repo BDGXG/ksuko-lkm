@@ -61,6 +61,7 @@ atomic64_t e_scan, e_gate, e_write;
 atomic64_t kaddr_hits;
 };
 
+static int g_probe_hits;
 static struct drm_stats g_stats;
 
 static bool drm_uid_allowed(void)
@@ -301,6 +302,14 @@ static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td)
             nz |= head[8 + i];
         if (!nz)
             continue;
+
+        if (g_probe_hits < 6) {
+            g_probe_hits++;
+            pr_info("probe hit p=%zu dsz=%zu off=%zu dt=%u len=%u b0=%02x%02x%02x%02x b8=%02x%02x%02x%02x\n",
+                    (size_t)pos, (size_t)td->data_size, (size_t)td->offsets_size,
+                    status, len, head[0], head[1], head[2], head[3],
+                    head[8], head[9], head[10], head[11]);
+        }
 
         atomic64_inc(&g_stats.w_cand);
         if (!READ_ONCE(g_apply)) {
