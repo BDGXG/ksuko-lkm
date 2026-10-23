@@ -1,8 +1,6 @@
 "use strict";
 const API = ["http://127.0.0.1:16667/cgi-bin/api", "/cgi-bin/api"];
 const $ = id => document.getElementById(id);
-// 启动探针：确认脚本真的被执行（排查“一直检测中”）
-try { var _dl = document.getElementById("devline"); if (_dl) _dl.textContent = "JS 已加载 build-1970"; } catch (e) {}
 let pending = null, pickMode = "ssaid", apps = [], appMap = {}, appsByPkg = {}, targets = [], rest = {};
 
 const toast = t => {
@@ -10,7 +8,10 @@ const toast = t => {
   clearTimeout(window.__t); window.__t = setTimeout(() => e.classList.remove("show"), 1800);
 };
 const esc = s => String(s == null ? '' : s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/["']/g, function (c) {
+    return ['&', c === '"' ? 'quot' : '#39', ';'].join('');
+  });
 
 // 从可能的脏输出中截取 JSON（后端偶有 native 工具把结果打到 stdout）
 function pickJson(t) {
@@ -40,8 +41,8 @@ async function api(action, value) {
 
 const IDS = [["serial","序列号"],["androidid","安卓 ID"],["oaid","广告标识"],["drmid","DRM ID"]];
 
-async function loadApps() {
-  if (apps.length) return;
+async function loadApps(force) {
+  if (apps.length && !force) return;
   try {
     const v = JSON.parse(await api("apps-cached"));
     apps = Array.isArray(v) ? v : [];
@@ -99,8 +100,8 @@ async function doStatus() {
       '</div>';
     return '<div class="idcard">' +
       '<div class="ihd"><b>' + n + '</b>' + badge + cg + nr + rb + act + '</div>' +
-      row('原值', orig) +
-      row('当前', cur) +
+      (k === "androidid" ? ''
+        : (k === "oaid" ? row('当前', cur) : row('原值', orig) + row('当前', cur))) +
       cardTools(k) +
       '</div>';
   }).join("");
@@ -108,6 +109,8 @@ async function doStatus() {
   targets = String(drm.pkgs || "").split(",").filter(Boolean);
   renderTargets();
   renderDrmChips();
+  ssaidPkgs = String(cfg.ssaid_pkgs || "").split(",").filter(Boolean);
+  ssaidMap = d.ssaid_map || [];
   renderPkgChips();
   if (drm.virtual_id) $("in-drm").value = drm.virtual_id;
 
@@ -132,6 +135,7 @@ async function doStatus() {
 
 function renderTargets() {
   const box = $("targets");
+  if (!box) return;                 // 02 区的「作用于」列表已移除，这里直接跳过
   if (!targets.length) {
     box.innerHTML = '<div class="line"><span class="v" style="text-align:left">全部应用（未限定）</span></div>';
     if ($("tgtcount")) $("tgtcount").textContent = "全部应用";
@@ -231,11 +235,17 @@ async function openPicker(mode) {
   else ssaidPkgs.forEach(p => pickSel.pkg.add(p));
   $("pmask").classList.add("show");
   $("alist").innerHTML = "加载中…";
-  await loadApps();
+  await loadApps(true);          // 打开选择器时重取 apps.json，装/卸应用后不至于显示旧列表
   if (!apps.length) {
     try { apps = JSON.parse(await api("apps")); appMap = {}; apps.forEach(a => { appMap[String(a.uid)] = a; }); } catch (e) {}
   }
   renderPicker();
+}
+
+let pickTimer = null;
+function queueFilter() {
+  clearTimeout(pickTimer);
+  pickTimer = setTimeout(renderPicker, 120);
 }
 
 function renderPicker() {
@@ -245,7 +255,7 @@ function renderPicker() {
   $("alist").innerHTML = list.length ? list.map(a => {
     const sel = pickSel.pkg.has(a.pkg);
     return '<div class="arow" data-pkg="' + a.pkg + '" data-uid="' + a.uid + '" onclick="pick(this.dataset.pkg,this.dataset.uid)">' +
-      (a.icon ? '<img src="icons/' + a.pkg + '.png" onerror="this.style.visibility=\'hidden\'">' : '<img>') +
+      (a.icon ? '<img loading="lazy" decoding="async" src="icons/' + a.pkg + '.png" onerror="this.style.visibility=\'hidden\'">' : '<img>') +
       '<span class="p"><b>' + esc(a.label || a.pkg) + '</b><s>' + a.pkg + '</s></span>' +
       '<span class="ck' + (sel ? " on" : "") + '"></span></div>';
   }).join("") : '<div class="arow">没有匹配</div>';
@@ -263,6 +273,7 @@ function applyPicker() {
   } else {
     ssaidPkgs = Array.from(pickSel.pkg);
     renderPkgChips();
+    api("ssaidpkgs", ssaidPkgs.join(",")).catch(function(){});
     toast("已选 " + ssaidPkgs.length + " 个应用");
   }
   closePicker();
@@ -274,7 +285,8 @@ async function refreshApps() {
   $("alist").innerHTML = "扫描中，请稍候（约 10~30 秒）…";
   try {
     apps = JSON.parse(await api("apps"));
-    appMap = {}; apps.forEach(a => { appMap[String(a.uid)] = a; });
+    appMap = {}; appsByPkg = {};
+    apps.forEach(a => { if (a && a.pkg) { appMap[String(a.uid)] = a; appsByPkg[a.pkg] = a; } });
     renderPicker();
     toast("已刷新 " + apps.length + " 个");
   } catch (e) { $("alist").innerHTML = "刷新失败"; }
@@ -307,7 +319,7 @@ function cardTools(k) {
     '<button class="btn btn-gray btn-sm btn-full" onclick="setSerial()">写入序列号</button>' +
     '</details></div>';
   if (k === "androidid") return '<div class="cdtools">' +
-    '<div class="ihead"><div class="chips" id="pkgChip"></div></div>' +
+    '<div class="pkglist" id="pkgChip"></div>' +
     '<div class="hint" style="margin-top:8px">选好后点右上角「随机」；没选则重置全部。改完需重启才生效。</div></div>';
   if (k === "oaid") return '<div class="cdtools">' +
     '<div class="hint" style="margin:0">本机 OAID 由系统服务下发，只能轮换、不能指定值；轮换后应用要重新查询才看得到。</div></div>';
@@ -315,7 +327,6 @@ function cardTools(k) {
     '<div class="field"><label>虚拟 ID（64 位十六进制，改完自动下发）</label>' +
     '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +
     '<div class="ihead"><div class="chips" id="drmChips"></div></div>' +
-    '<div class="orow"><span>改完停掉生效应用</span><label class="sw"><input type="checkbox" id="optDrmStop" onchange="toggleOpt(\'drmstop\',this)"><i></i></label></div>' +
     '<div class="hint" id="drmStat">内核状态：—</div></div>';
 }
 // 应用小卡：只显示 图标 + 应用名（不显示包名）
@@ -350,18 +361,38 @@ function renderDrmChips() {
 
 // 安卓 ID 选中的应用列表（内存态；空 = 全部）
 let ssaidPkgs = [];
+let ssaidMap = [];
 
 function renderPkgChips() {
   const box = $("pkgChip"); if (!box) return;
-  box.innerHTML = ssaidPkgs.map(function (p) {
-    const a = (apps || []).filter(function (x) { return x.pkg === p; })[0];
-    return iconChip(a, p, "rmSsaidPkg('" + p + "')");
-  }).join("") + addBtn("ssaid");
+  let html = "";
+  ssaidPkgs.forEach(function (p) {
+    const a = appsByPkg[p];
+    const label = a ? (a.label || a.pkg) : p;
+    const m = (ssaidMap || []).filter(function (x) { return x.pkg === p; })[0] || {};
+    const ic = a && a.icon
+      ? '<img src="icons/' + a.pkg + '.png" onerror="this.style.display=\'none\'">'
+      : '<span class="noic">' + esc(label.charAt(0)) + '</span>';
+    const rowv = function (k, v, cls) {
+      const t = v || "未分配";
+      return '<div class="pkgl"><span class="k">' + k + '</span>' +
+        '<span class="v ' + (cls || '') + '">' + esc(t) + '</span>' +
+        (v ? '<button class="copybtn" data-v="' + esc(v) + '" onclick="copy(this.dataset.v)">复制</button>' : '') +
+        '</div>';
+    };
+    html += '<div class="pkgrow">' +
+      '<div class="pkghd">' + ic + '<b>' + esc(label) + '</b>' +
+      '<i data-p="' + esc(p) + '" onclick="rmSsaidPkg(this.dataset.p)">×</i></div>' +
+      rowv("原值", m.orig) + rowv("当前", m.cur, "cur") +
+      '</div>';
+  });
+  box.innerHTML = html + addBtn("ssaid");
 }
 
 function rmSsaidPkg(p) {
   ssaidPkgs = ssaidPkgs.filter(function (x) { return x !== p; });
   renderPkgChips();
+  api("ssaidpkgs", ssaidPkgs.join(",")).catch(function(){});
 }
 
 function rmDrmTarget(uid) {
@@ -422,8 +453,6 @@ window.onerror = function (m, s, l) {
   try {
     var t = document.getElementById("statusText");
     if (t) t.textContent = "ERR";
-    var d = document.getElementById("devline");
-    if (d) d.textContent = "错误：" + m + " @" + l;
     var pill = document.getElementById("statusPill");
     if (pill) pill.classList.remove("ok");
   } catch (e) {}

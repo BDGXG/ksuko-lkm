@@ -12,14 +12,18 @@ VAL=""
 case "$Q" in
   *value=*) VAL="${Q#*value=}"; VAL="${VAL%%&*}" ;;
 esac
-# 简单 URL 解码
-ACT=$(printf '%b' "${ACT//%/\\x}" 2>/dev/null | tr '+' ' ')
-VAL=$(printf '%b' "${VAL//%/\\x}" 2>/dev/null | tr '+' ' ')
+# URL 解码：先把反斜杠转义一层，避免值里的 \ 被 printf %b 当成转义序列
+urldecode() {
+  _u=$(printf '%s' "$1" | sed 's/\\/\\\\/g')
+  printf '%b' "${_u//%/\\x}" 2>/dev/null | tr '+' ' '
+}
+ACT=$(urldecode "$ACT")
+VAL=$(urldecode "$VAL")
 
 case "$ACT" in
   status|apply|randomize|restore|log|drm-info|drm-off|drm|drm-stats|setmaster|serial-restore|drmid-rand|oaid|appset|baseline)
        OUT=$(sh "$DIM" "$ACT") ;;
-  serial|ssaid|drmid|uids|haluid|conf|opt-stop|opt-qimei|opt-drmstop|drmpkgs)
+  serial|ssaid|drmid|uids|haluid|conf|opt-stop|opt-qimei|opt-drmstop|ssaidpkgs|drmpkgs)
        OUT=$(sh "$DIM" "$ACT" "$VAL") ;;
   apps)  OUT=$(sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1; cat /data/adb/dim/apps.json 2>/dev/null) ;;
   apps-cached) OUT=$(cat /data/adb/dim/apps.json 2>/dev/null) ;;
@@ -29,6 +33,6 @@ esac
 
 printf 'Content-Type: application/json; charset=utf-8\r\n'
 printf 'Cache-Control: no-store\r\n'
-printf 'Access-Control-Allow-Origin: *\r\n'
+printf 'X-Content-Type-Options: nosniff\r\n'
 printf '\r\n'
 printf '%s' "$OUT"
