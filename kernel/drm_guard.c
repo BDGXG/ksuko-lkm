@@ -684,7 +684,9 @@ WRITE_ONCE(g_enable, false);
 drm_disarm_locked();
 mutex_unlock(&g_ctl_lock);
 } else if (!strncmp(buf, "oaid ", 5)) {
-if (drm_hex2bin(buf + 5, g_oaid, 64))
+{int _r = drm_hex2bin(buf + 5, g_oaid, 64);
+pr_info("oaid cmd: len=%u rc=%d c5=%02x\n", (unsigned int)strlen(buf), _r, (u8)buf[5]);
+if (_r)
 return -EINVAL;
 WRITE_ONCE(g_oaid_set, true);
 pr_info("oaid target set\n");
