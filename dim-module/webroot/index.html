@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2198</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2199</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -657,10 +657,9 @@ async function doStatus() {
   let s;
   try { s = await api("status"); }
   catch (e) {
-    toast("后台未响应");
     const d = $("devline");
-    if (d) d.textContent = "后台未响应：" + e.message + "（127.0.0.1:16667）";
-    return;
+    if (d) d.textContent = "后台启动中…（" + e.message + "）";
+    throw e;   // 交给外层 boot() 重试，避免首次开机卡在「检测中」
   }
   let d;
   try { d = JSON.parse(s); } catch (e) { return; }
@@ -704,7 +703,8 @@ async function doStatus() {
     const row = (label, v, cls) =>
       '<div class="irow"><span class="k">' + label + '</span>' +
       '<span class="v ' + (cls || '') + '">' +
-        (v ? esc(v) : (k === 'oaid' && label === '原值' ? '—（系统未持久化，无真值）' : '—')) + '</span>' +
+        (v ? esc(v) : (k === 'oaid' && label === '原值' ? '—（系统未持久化，无真值）'
+          : (k === 'drmid' && label === '原值' ? '—（首次伪装前未捕获）' : '—'))) + '</span>' +
       (v ? '<button class="copybtn" data-v="' + esc(v) + '" onclick="copy(this.dataset.v)">复制</button>' : '<span class="copybtn ghost"></span>') +
       '</div>';
     return '<div class="idcard">' +
@@ -796,7 +796,7 @@ async function saveTargets() {
     await api("drm");
     toast("已更新目标应用");
   } catch (e) { toast("保存失败：" + e.message); }
-  doStatus();
+  doStatus().catch(function () {});
 }
 function removeTarget(uid) {
   targets = targets.filter(x => x !== uid);
@@ -841,7 +841,7 @@ async function closeDlg(ok) {
       toast("完成");
     }
   } catch (e) { toast("失败：" + e.message); }
-  doStatus();
+  doStatus().catch(function () {});
 }
 
 function restoreMsg() {
@@ -964,7 +964,7 @@ async function applyDrmId() {
     await api("drm");
     toast("已下发");
   } catch (e) { toast("失败：" + e.message); }
-  doStatus();
+  doStatus().catch(function () {});
 }
 
 // 卡片右上角的「生成 / 清除」支持矩阵与动作映射
@@ -1132,10 +1132,19 @@ window.onerror = function (m, s, l) {
   } catch (e) {}
   return false;
 };
-doStatus().catch(function (e) {
-  var d = document.getElementById("devline");
-  if (d) d.textContent = "doStatus 失败：" + e.message;
-});
+// 首次打开：httpd 可能还没起来，自动重试（700ms x 12 次 ≈ 8 秒），
+// 不要再让用户「退出重进」才能用
+(function boot(retries) {
+  doStatus().catch(function (e) {
+    if (retries > 0) {
+      setTimeout(function () { boot(retries - 1); }, 700);
+      return;
+    }
+    var d = document.getElementById("devline");
+    if (d) d.textContent = "后台未响应：" + e.message;
+    toast("后台未响应");
+  });
+})(12);
 </script>
 </body>
 </html>

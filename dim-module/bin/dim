@@ -48,7 +48,7 @@ gen_aid()     { rand_hex 8; }
 # DRM 虚拟 ID：避开 Base64 里会出现 + / 的取值（DevCheck 用 Base64 显示，纯字母数字更清爽）
 gen_drmid()   {
   _i=0
-  while [ "$_i" -lt 12 ]; do
+  while [ "$_i" -lt 64 ]; do
     _h=$(rand_hex 32)
     if [ -x "$BB" ]; then
       _b=$(printf '%s' "$_h" | "$BB" xxd -r -p 2>/dev/null | "$BB" base64 2>/dev/null | tr -d '\n')
@@ -508,6 +508,9 @@ do_status() {
   t_aid=$(head -1 "$STATE/ssaid.target" 2>/dev/null)
   [ -f "$STATE/pending_reboot" ] || t_aid=""
   drm_id=$(drm_get id); drm_mode=$(drm_get mode); drm_en=$(drm_get enabled)
+  # identity.json 可能被「恢复原样/卸载」删掉：那时用内核里实际生效的 id 当目标值，
+  # 否则面板永远「未设置」、已生效计数恒为 0
+  [ -n "$t_drm" ] || t_drm="$drm_id"
   drm_arm=$(drm_get armed); drm_hal=$(drm_get haluid); drm_uids=$(drm_uids_list)
 
   printf '{"ok":true,'
