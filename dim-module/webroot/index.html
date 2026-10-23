@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2197</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2198</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -949,6 +949,13 @@ function setSerial() {
   if (!/^[0-9A-Fa-f]{16}$/.test(v)) return toast("需要 16 位十六进制");
   confirmDo("写入 Serial", v, "serial", v);
 }
+function drmRepush() {
+  api("drm").then(function (v) {
+    toast(v && v.ok === false ? "下发失败" : "已重新下发");
+    doDrmStats();
+  }).catch(function (e) { toast("下发失败：" + e.message); });
+}
+
 async function applyDrmId() {
   const v = ($("in-drm").value || "").trim();
   if (v && !/^[0-9a-fA-F]{64}$/.test(v)) return toast("需 64 位十六进制");
@@ -979,7 +986,8 @@ function cardTools(k) {
     '<div class="field"><label>虚拟 ID（64 位十六进制，改完自动下发）</label>' +
     '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +
     '<div class="ihead"><div class="chips" id="drmChips"></div></div>' +
-    '<div class="hint" id="drmStat">内核状态：—</div></div>';
+    '<div class="hint" id="drmStat">内核状态：—</div>' +
+    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:8px" onclick="drmRepush()">重新下发到内核</button></div>';
 }
 // 应用小卡：只显示 图标 + 应用名（不显示包名）
 // 只显示应用图标的大号 chip（点一下移除）
@@ -1099,7 +1107,7 @@ async function doDrmStats() {
     const kp = kern && kern.release ? ("内核 " + String(kern.release).split("-")[0] + " · ") : "";
     if (!d.ok) { if (el) el.textContent = kp + "节点不存在（内核模块未加载）"; return; }
     const on = d.enabled === "1" && d.mode === "apply";
-    if (el) el.textContent = kp + "内核：" + (on ? "生效中" : "未生效") + " · " + d.mode +
+    if (el) el.textContent = kp + "内核：" + (on ? "生效中" : "未生效（点下方重新下发）") + " · " + d.mode +
       " · armed=" + d.armed + " · 命中 " + d.exact_hits + " · 写入 " + d.written + " · 失败 " + d.nofault_fail;
   } catch (e) {
     if (el) el.textContent = "内核状态：读取失败";
