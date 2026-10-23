@@ -66,7 +66,7 @@ fi
 # 3.5) 应用列表：apps.json 缺失就先用 pm 快列表顶上，图标放后台慢慢生成
 if [ ! -s /data/adb/dim/apps.json ]; then
   sh "$MODDIR/bin/apps.sh" >/dev/null 2>&1
-  ( sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1 ) &
+  ( nice -n 19 sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1 ) 2>/dev/null &
   log "apps.json seeded, icons extracting in background"
 fi
 
