@@ -1,81 +1,79 @@
 #!/system/bin/sh
-# 加载内核模块：按内核版本挑 ko（KMI 名优先），并校验 vermagic，避免把错版本的 ko 塞进去
+# 加载内核模块
+#   规则照抄内核拦截模块（hideguard/susfs_boot.sh）：ko/<X.Y>.ko 优先、带锁、
+#   已加载就跳过、只校验 vermagic 主次版本，不搞太多花活。
 MODDIR=${0%/*}
 MODDIR=${MODDIR%/bin}
 LOG=/data/adb/dim/state/daemon.log
-mkdir -p /data/adb/dim/state 2>/dev/null
+STATE=/data/adb/dim/state
+LOCK="$STATE/ko.lock"
+mkdir -p "$STATE" 2>/dev/null
 
 log() { printf '[%s] ko: %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
 
 CHECK=0
 [ "$1" = "check" ] && CHECK=1
 
-# 已经被别的东西（比如 susfs_guard_lkm 模块自己）加载就不用管
+# 已经加载（不管是 dim 还是内核拦截模块加载的）就直接返回
 if [ "$CHECK" != "1" ] && [ -d /sys/module/susfs_guard_lkm ]; then
-  log "already loaded (by other module)"
+  log "already loaded"
   echo loaded
   exit 0
 fi
 
-REL=$(uname -r)
+REL=$(uname -r 2>/dev/null)
 KMM=$(printf '%s' "$REL" | cut -d. -f1,2)
-ANDROID=$(printf '%s' "$REL" | sed -n 's/.*android\([0-9][0-9]*\).*/\1/p')
 
-# 候选顺序：android<X>-<major.minor>.ko → <major.minor>.ko → ko/ 下任意 *.ko
-CANDS=""
-[ -n "$ANDROID" ] && CANDS="$CANDS $MODDIR/ko/android${ANDROID}-${KMM}.ko"
-CANDS="$CANDS $MODDIR/ko/${KMM}.ko"
-for f in "$MODDIR/ko"/*.ko; do [ -f "$f" ] && CANDS="$CANDS $f"; done
-
-vm_of() { grep -ao 'vermagic=[^ ]*' "$1" 2>/dev/null | head -1 | sed 's/^vermagic=//'; }
-
-pick_ko() {
-  for k in $CANDS; do
-    [ -f "$k" ] || continue
-    vm=$(vm_of "$k")
-    [ -n "$vm" ] || { log "skip $(basename "$k"): no vermagic"; continue; }
-    # GKI 在同一 KMI 内 ABI 稳定，patch 级别可以不同（6.6.118 上跑 6.6.127 编的 ko，
-    # vermagic 由 susfs_insmod 改写）。这里只比 major.minor + android 标签。
-    vmver=${vm%%-*}
-    case "$vmver" in
-      "$KMM"|"$KMM".*) ;;
-      *) log "skip $(basename "$k"): vermagic $vmver not in $KMM.x"; continue ;;
-    esac
-    case "$vm" in
-      *android*)
-        if [ -z "$ANDROID" ]; then log "skip $(basename "$k"): host release has no android tag"; continue; fi
-        printf '%s' "$vm" | grep -aq "android${ANDROID}" \
-          || { log "skip $(basename "$k"): android tag mismatch (vm=$vm)"; continue; }
-        ;;
-    esac
-    printf '%s\n' "$k"; return 0
+# 选 ko：ko/<X.Y>.ko 优先；其次 ko/ 下任何以 <X.Y>.ko 结尾的（兼容 android15-6.6.ko 之类）
+KO=""
+if [ -n "$KMM" ] && [ -f "$MODDIR/ko/$KMM.ko" ]; then
+  KO="$MODDIR/ko/$KMM.ko"
+else
+  for f in "$MODDIR/ko"/*"$KMM".ko "$MODDIR/ko"/*.ko; do
+    [ -f "$f" ] || continue
+    KO="$f"
+    break
   done
-  return 1
-}
+fi
 
-KO=$(pick_ko)
+# 并发锁：post-fs-data 和手动 dim ko 可能撞车（没有 flock 就跳过）
+if [ "$CHECK" != "1" ] && command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK" 2>/dev/null && flock 9 2>/dev/null
+fi
+
 if [ -z "$KO" ]; then
-  log "no matching ko for $REL; candidates:$CANDS"
-  echo "no-matching-ko"
+  log "no ko for kernel $REL (ko dir: $(ls "$MODDIR/ko" 2>/dev/null | tr '\n' ' '))"
+  echo "no-ko"
   exit 1
 fi
-log "picked $(basename "$KO") for $REL"
+
+# vermagic 只比主次版本（6.6 / 6.12），patch 级别允许不同：
+# 同一 KMI 内 ABI 稳定，release 串由 susfs_insmod 就地改写
+VM=$(grep -a -o 'vermagic=[0-9][^ ]*' "$KO" 2>/dev/null | head -1 | cut -d= -f2)
+VMM=$(printf '%s' "$VM" | cut -d. -f1,2)
+if [ -n "$VMM" ] && [ "$VMM" != "$KMM" ]; then
+  log "REFUSE: $(basename "$KO") vermagic=$VM, kernel=$KMM"
+  echo "vermagic-mismatch"
+  exit 1
+fi
 
 if [ "$CHECK" = "1" ]; then
-  printf 'ko=%s\nvermagic=%s\nrelease=%s\n' "$KO" "$(vm_of "$KO")" "$REL"
+  printf 'ko=%s\nvermagic=%s\nrelease=%s\n' "$KO" "${VM:-unknown}" "$REL"
   exit 0
 fi
 
+log "loading $(basename "$KO") for $REL"
+
 if [ -x /data/adb/ksu/bin/ksud ]; then
   out=$(/data/adb/ksu/bin/ksud insmod "$KO" 2>&1)
-  log "ksud insmod $(basename "$KO"): $out"
 elif [ -x "$MODDIR/bin/susfs_insmod" ]; then
   out=$(sh "$MODDIR/bin/susfs_insmod" "$KO" 2>&1)
-  log "susfs_insmod: $out"
 else
   log "no loader available"
+  echo no-loader
   exit 1
 fi
+log "insmod out: $out"
 
 if [ -d /sys/module/susfs_guard_lkm ]; then
   log "loaded ok"
