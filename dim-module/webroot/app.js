@@ -41,6 +41,11 @@ async function api(action, value) {
 
 const IDS = [["serial","序列号"],["androidid","安卓 ID"],["oaid","广告标识"],["drmid","DRM ID"]];
 
+function rebuildMaps() {
+  appMap = {}; appsByPkg = {};
+  apps.forEach(a => { if (a && a.pkg) { appMap[String(a.uid)] = a; appsByPkg[a.pkg] = a; } });
+}
+
 async function loadApps(force) {
   if (apps.length && !force) return;
   try {
@@ -245,7 +250,21 @@ async function openPicker(mode) {
   $("alist").innerHTML = "加载中…";
   await loadApps(true);          // 打开选择器时重取 apps.json，装/卸应用后不至于显示旧列表
   if (!apps.length) {
-    try { apps = JSON.parse(await api("apps")); appMap = {}; apps.forEach(a => { appMap[String(a.uid)] = a; }); } catch (e) {}
+    // 先用 pm 快列表（1 秒内）把选择器顶出来，图标再后台慢慢补，
+    // 否则首次会卡在“加载中”十几秒（proot + PIL + aapt）
+    try { apps = JSON.parse(await api("apps-fast")); rebuildMaps(); } catch (e) {}
+    if (apps.length) {
+      renderPicker();
+      api("apps").then(function (v) {
+        try {
+          const l = JSON.parse(v);
+          if (Array.isArray(l) && l.length) { apps = l; rebuildMaps(); renderPicker(); }
+        } catch (e) {}
+      }).catch(function () {});
+      return;
+    }
+    // 快列表也失败才退回慢路径
+    try { apps = JSON.parse(await api("apps")); rebuildMaps(); } catch (e) {}
   }
   renderPicker();
 }
