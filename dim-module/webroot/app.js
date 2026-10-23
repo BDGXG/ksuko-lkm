@@ -206,7 +206,8 @@ async function closeDlg(ok) {
       for (const pkg of list) await api("ssaid", pkg);
       toast("已重置 " + list.length + " 个应用");
     } else {
-      await api(p.action, p.value);
+      const r = await api(p.action, p.value);
+      if (r && r.ok === false) throw new Error(r.error || "操作失败");
       toast("完成");
     }
   } catch (e) { toast("失败：" + e.message); }

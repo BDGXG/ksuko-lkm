@@ -350,8 +350,13 @@ oaid_rotate() {
   # rotate 会把新 OUID 打到 stdout，这就是后续查询会拿到的新广告标识
   ov=$(printf '%s\n' "$out" | sed -n 's/^OUID=//p' | head -1)
   if [ -n "$ov" ]; then
+    OAID_OK=1
     printf '%s\n' "$ov" > "$STATE/oaid.current"
     log "oaid rotated -> $ov"
+  else
+    # 非 OPLUS ROM / 服务被禁用时没有任何 OUID 输出，明确报失败
+    OAID_ERR=$(printf '%s\n' "$out" | sed -n 's/^OAID_ERROR=//p' | head -1)
+    log "oaid rotate: no OUID (err=${OAID_ERR:-none})"
   fi
   OAID_CLEARED=$(oaid_cache_clear)
   log "oaid rotate (cache cleared: $OAID_CLEARED pkg)"
@@ -741,9 +746,13 @@ case "$1" in
   ssaid)       do_ssaid "$2" "${3:-all}" ;;
   ssaid-restore) ssaid_restore_pkg "$2" ;;
   appset)      appset_reset; echo '{"ok":true}' ;;
-  oaid)        oaid_rotate
-               printf '{"ok":true,"oaid":"%s","cache_cleared":%s}\n' \
-                 "$(head -1 "$STATE/oaid.current" 2>/dev/null)" "${OAID_CLEARED:-0}" ;;
+  oaid)        OAID_OK=0; oaid_rotate
+               if [ "${OAID_OK:-0}" = "1" ]; then
+                 printf '{"ok":true,"oaid":"%s","cache_cleared":%s}\n' \
+                   "$(head -1 "$STATE/oaid.current" 2>/dev/null)" "${OAID_CLEARED:-0}"
+               else
+                 printf '{"ok":false,"error":"oaid_unavailable","cache_cleared":%s}\n' "${OAID_CLEARED:-0}"
+               fi ;;
   drm)         drm_push; echo '{"ok":true}' ;;
   drm-off)     drm_off; echo '{"ok":true}' ;;
   drm-stats)   drm_stats ;;
