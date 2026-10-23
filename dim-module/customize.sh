@@ -6,10 +6,17 @@ ui_print "- 架构: $(uname -m)"
 
 [ "$(uname -m)" = "aarch64" ] || abort "! 仅支持 arm64"
 
-chmod 0755 "$MODPATH/bin/dim" 2>/dev/null
-chmod 0755 "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh" 2>/dev/null
-[ -f "$MODPATH/bin/oaid-runtime.jar" ] && chmod 0644 "$MODPATH/bin/oaid-runtime.jar"
-[ -d "$MODPATH/webroot" ] && chmod -R 0644 "$MODPATH/webroot"
+# 权限：目录必须带 x 位，CGI 必须可执行
+#   注意不要用 chmod -R 0644 webroot：会把目录和 cgi-bin/api 的 x 位一起抹掉，
+#   结果是 httpd 找不到 CGI，面板永远「检测中」（实测过）
+chmod 0755 "$MODPATH" "$MODPATH/bin" "$MODPATH/ko" \
+           "$MODPATH/webroot" "$MODPATH/webroot/cgi-bin" 2>/dev/null
+chmod 0755 "$MODPATH"/*.sh "$MODPATH/bin"/*.sh "$MODPATH/bin/dim" \
+           "$MODPATH/bin/susfs_insmod" "$MODPATH/webroot/cgi-bin/api" 2>/dev/null
+chmod 0644 "$MODPATH/module.prop" "$MODPATH/config.conf.example" "$MODPATH/README.md" \
+           "$MODPATH/bin/appicon.py" "$MODPATH/bin/oaid-runtime.jar" \
+           "$MODPATH/webroot/index.html" "$MODPATH/webroot/app.js" 2>/dev/null
+for _k in "$MODPATH/ko"/*.ko; do [ -f "$_k" ] && chmod 0644 "$_k"; done
 
 # 配置与状态放在模块目录之外，升级不丢
 mkdir -p /data/adb/dim/state

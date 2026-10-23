@@ -25,4 +25,17 @@ fi
 [ -e /proc/susfs_drm_guard ] && echo "enable 0" > /proc/susfs_drm_guard 2>/dev/null
 
 sh "$MODDIR/bin/httpd_ctl.sh" stop 2>/dev/null
+
+# 卸载前把配置与状态（含原值备份）留一份到内部存储：重装后可直接拷回去，
+# 否则 rm -rf /data/adb/dim 会把 original.json、ssaid 备份一起删掉
+TS=$(date +%Y%m%d-%H%M%S)
+BK=/sdcard/Download/dim-uninstall-$TS
+if mkdir -p "$BK" 2>/dev/null; then
+  cp -a /data/adb/dim/config.conf "$BK"/ 2>/dev/null
+  cp -a /data/adb/dim/state "$BK"/ 2>/dev/null
+  echo "dim: config/state backed up to $BK"
+else
+  echo "dim: cannot write $BK, skip backup"
+fi
+
 rm -rf /data/adb/dim
