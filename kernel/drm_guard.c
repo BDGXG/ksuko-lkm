@@ -95,7 +95,7 @@ return 0;
 
 static int drm_u_write(void __user *dst, const void *src, size_t n)
 {
-if (copy_to_user_nofault(dst, src, n)) {
+if (copy_to_user_nofault(dst, src, n) && copy_to_user(dst, src, n)) {
 atomic64_inc(&g_stats.nofault_fail);
 return -EFAULT;
 }
