@@ -102,6 +102,94 @@ return -EFAULT;
 return 0;
 }
 
+static u8 g_oaid[64];
+static bool g_oaid_set;
+static bool g_oapply;
+static atomic64_t g_oaid_cand = ATOMIC64_INIT(0);
+static atomic64_t g_oaid_written = ATOMIC64_INIT(0);
+static atomic64_t g_oaid_fail = ATOMIC64_INIT(0);
+
+static bool drm_try_patch_oaid(struct binder_transaction_data *td)
+{
+void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
+u8 buf[256];
+u8 out[128];
+u32 n, i, best = 0, bestlen = 0, cur = 0, cs = 0;
+
+if (!READ_ONCE(g_oapply) || !READ_ONCE(g_oaid_set) || !parcel)
+return false;
+n = td->data_size;
+if (n < 64 || n > sizeof(buf))
+return false;
+if (drm_u_read(buf, parcel, n))
+return false;
+for (i = 0; i + 1 < n; i += 2) {
+u8 c = buf[i];
+int ish = ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+if (ish && buf[i + 1] == 0) {
+if (!cur) cs = i;
+cur++;
+if (cur > bestlen) { bestlen = cur; best = cs; }
+} else cur = 0;
+}
+if (bestlen < 64)
+return false;
+atomic64_inc(&g_oaid_cand);
+for (i = 0; i < 64; i++) {
+out[i * 2] = g_oaid[i];
+out[i * 2 + 1] = 0;
+}
+if (drm_u_write(parcel + best, out, sizeof(out))) {
+atomic64_inc(&g_oaid_fail);
+return false;
+}
+atomic64_inc(&g_oaid_written);
+pr_info("oaid patched: off=%u dsz=%u\n", best, n);
+return true;
+}
+
+static bool g_pstr;
+static atomic64_t g_pstr_dumps = ATOMIC64_INIT(0);
+static atomic64_t g_pstr_seen = ATOMIC64_INIT(0);
+
+static void drm_probe_string(struct binder_transaction_data *td)
+{
+void __user *p = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
+u8 buf[256];
+char ascii[97];
+u32 n, i, run = 0, hexrun = 0, ara = 0, arun = 0;
+
+if (!READ_ONCE(g_pstr) || !p)
+return;
+n = td->data_size;
+if (n < 32 || n > sizeof(buf))
+return;
+if (drm_u_read(buf, p, n))
+return;
+atomic64_inc(&g_pstr_seen);
+for (i = 0; i + 1 < n; i += 2) {
+u8 c = buf[i];
+int ish = ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+if (ish && buf[i + 1] == 0) { run++; if (run > hexrun) hexrun = run; }
+else run = 0;
+}
+for (i = 0; i < n; i++) {
+u8 c = buf[i];
+int ish = ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+if (ish) { ara++; if (ara > arun) arun = ara; }
+else ara = 0;
+}
+if (hexrun < 60 && arun < 60)
+return;
+if (atomic64_inc_return(&g_pstr_dumps) > 32)
+return;
+for (i = 0; i < 96 && i < n; i++)
+ascii[i] = (buf[i] >= 32 && buf[i] < 127) ? (char)buf[i] : '.';
+ascii[i] = 0;
+pr_info("pstr4: tgid=%d dsz=%u u16hex=%u ahex=%u seen=%lld\n", current->tgid, n, hexrun, arun, atomic64_read(&g_pstr_seen));
+pr_info("pstr4: %s\n", ascii);
+}
+
 static bool drm_try_patch(struct binder_transaction_data *td)
 {
 void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
@@ -201,6 +289,9 @@ if (td.data_size == 40)
 atomic64_inc(&g_stats.r_sz40);
 atomic64_inc(&g_stats.reply_seen);
 drm_try_patch(&td);
+drm_try_patch_oaid(&td);
+if (READ_ONCE(g_pstr))
+drm_probe_string(&td);
 }
 off += step;
 }
@@ -592,6 +683,25 @@ mutex_lock(&g_ctl_lock);
 WRITE_ONCE(g_enable, false);
 drm_disarm_locked();
 mutex_unlock(&g_ctl_lock);
+} else if (!strncmp(buf, "oaid ", 5)) {
+if (drm_hex2bin(buf + 5, g_oaid, 64))
+return -EINVAL;
+WRITE_ONCE(g_oaid_set, true);
+pr_info("oaid target set\n");
+} else if (!strcmp(buf, "oapply 1")) {
+WRITE_ONCE(g_oapply, true);
+pr_warn("oaid apply ON\n");
+} else if (!strcmp(buf, "oapply 0")) {
+WRITE_ONCE(g_oapply, false);
+pr_info("oaid apply OFF\n");
+} else if (!strcmp(buf, "pstr 1")) {
+WRITE_ONCE(g_pstr, true);
+atomic64_set(&g_pstr_dumps, 0);
+atomic64_set(&g_pstr_seen, 0);
+pr_warn("pstr probe ON\n");
+} else if (!strcmp(buf, "pstr 0")) {
+WRITE_ONCE(g_pstr, false);
+pr_info("pstr probe OFF\n");
 } else if (!strcmp(buf, "reset")) {
 atomic64_set(&g_stats.calls, 0);
 atomic64_set(&g_stats.read_streams, 0);
