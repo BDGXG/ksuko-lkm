@@ -49,5 +49,10 @@ STOP_AFTER=1
 CLEAR_QIMEI=1
 # 改 DRM ID 后是否 force-stop 生效应用（关掉则玩游戏中改值不会被踢下线）
 DRM_STOP=1
-# 目标应用（按包名，换设备也能用）
-DRM_PKGS=
+# 目标应用（按包名，换设备也能用）。默认三角洲行动
+DRM_PKGS=com.tencent.tmgp.dfm
+
+# ---------- Android ID (SSAID) 目标应用 ----------
+# 面板里选中哪些应用就写这里；留空 = 面板没选时按「全部应用」处理
+# 默认三角洲行动
+SSAID_PKGS=com.tencent.tmgp.dfm
