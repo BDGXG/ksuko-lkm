@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2207</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2208</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -991,13 +991,10 @@ function cardTools(k) {
     '<div class="hint" style="margin:0">本机 OAID 由 com.heytap.openid 运行时下发，磁盘上没有真值，所以只能轮换、不能指定值，也无法还原。' +
     '<br>轮换后会自动停掉并清理目标应用的 OAID 缓存（umeng / 穿山甲），应用下次冷启动才会拿到新值。</div></div>';
   if (k === "drmid") return '<div class="cdtools">' +
-    '<div class="field"><label>虚拟 ID（64 位十六进制，改完自动下发）</label>' +
-    '<input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div>' +
+    '<details class="mini"><summary>手动指定虚拟 ID</summary>' +
+    '<div class="field" style="margin-top:10px"><input id="in-drm" placeholder="64 位十六进制" onchange="applyDrmId()"></div></details>' +
     '<div class="ihead"><div class="chips" id="drmChips"></div></div>' +
-    '<div class="hint" id="drmStat">内核状态：—</div>' +
-    '<div class="hint" style="margin-top:6px">实测为<b>部分改写</b>：应用读到的值与上方虚拟 ID 可能不完全一致，但已不再是真值。</div>' +
-    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:8px" onclick="drmRepush()">重新下发到内核</button>' +
-    '<button class="btn btn-gray btn-sm btn-full" style="margin-top:6px" onclick="drmReload()">重载内核模块</button></div>';
+    '<div class="hint" id="drmStat">内核状态：—</div></div>';
 }
 // 应用小卡：只显示 图标 + 应用名（不显示包名）
 // 只显示应用图标的大号 chip（点一下移除）

@@ -129,19 +129,15 @@ ColorOS 的 OAID 由 `com.heytap.openid` 运行时下发，磁盘上没有真值
 说明 `susfs_guard_lkm` 内核模块没加载：`cat /proc/susfs_drm_guard` 不存在。
 先装配套内核模块；`DRM_HALUID` 保持在 1013。
 
-**DRM ID 改了，但 DevCheck 里显示的不是我填的那个值**
+**DRM ID 改了，应用里看不到变化？**
 
-当前内核侧（`drm_guard.c`）对 HAL 回复是**部分改写**：能确认不再返回真值，
-但改写后的字节序列不一定和面板里的虚拟 ID 完全一致（HAL 的包裹布局和直接
-32 字节替换不完全对应）。
+每次修改 DRM ID（随机 / 手动指定 / 一键更换）都会**自动重载一次内核模块**
+（rmmod + insmod，约 2 秒），不需要手动点重载。
 
-如果某个应用对 deviceUniqueId 做严格校验（例如和证书里的 ID 比对），可能
-会认为异常；遇到 L1 播放类问题，把 ko 换回备份的初始版即可：
+如果应用仍显示旧值，说明它把 deviceUniqueId 缓存在自己进程里了：
+`am force-stop <包名>` 或重启一次即可。
 
-```sh
-cp /sdcard/Download/dim-ko-backup/6.6.ko.old /data/adb/modules/dim/ko/6.6.ko
-sh /data/adb/modules/dim/bin/dim drm-reload
-```
+实测（6.6.118 + DevCheck）：重载后 DevCheck 显示的值与面板「当前」完全一致。
 
 **应用列表空白**
 `/data/adb/dim/apps.json` 损坏或为空。删掉后重新打开选择器（会重新生成），
