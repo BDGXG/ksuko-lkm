@@ -61,6 +61,7 @@ atomic64_t e_scan, e_gate, e_write;
 atomic64_t kaddr_hits;
 };
 
+static int g_dump40;
 static struct drm_stats g_stats;
 
 static bool drm_uid_allowed(void)
@@ -251,6 +252,16 @@ if (drm_u_read(head, parcel, sizeof(head)))
 return false;
 memcpy(&status, head, 4);
 memcpy(&len, head + 4, 4);
+if (td->data_size == 40 && g_dump40 < 8) {
+    g_dump40++;
+    pr_info("dump40 st=%u len=%u b4=%02x%02x%02x%02x b8=%02x%02x%02x%02x b12=%02x%02x%02x%02x b16=%02x%02x%02x%02x b20=%02x%02x%02x%02x" "\n",
+        status, len,
+        head[4], head[5], head[6], head[7],
+        head[8], head[9], head[10], head[11],
+        head[12], head[13], head[14], head[15],
+        head[16], head[17], head[18], head[19],
+        head[20], head[21], head[22], head[23]);
+}
 if (status != 0 || len != DRM_ID_BYTES)
 return false;
 for (i = 0; i < DRM_ID_BYTES; i++)
