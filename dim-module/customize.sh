@@ -89,5 +89,12 @@ if [ ! -f /data/adb/dim/state/original.json ]; then
   printf '{"serial":"%s"}\n' "$(getprop ro.serialno)" > /data/adb/dim/state/original.json
 fi
 
+# 安装完直接拉起面板，免得用户不重启就打开 UI 一直「检测中」
+if [ -x "$MODPATH/bin/dim" ]; then
+  [ -x "$MODPATH/bin/httpd_ctl.sh" ] || chmod 0755 "$MODPATH/bin/httpd_ctl.sh" 2>/dev/null
+  sh "$MODPATH/bin/httpd_ctl.sh" start >/dev/null 2>&1
+  ui_print "- 面板已启动: http://127.0.0.1:16667/"
+fi
+
 ui_print "- 完成。命令: sh /data/adb/modules/dim/bin/dim status"
 ui_print "- 打开配置: /data/adb/dim/config.conf"
