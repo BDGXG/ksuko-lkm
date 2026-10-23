@@ -102,7 +102,7 @@ return -EFAULT;
 return 0;
 }
 
-static u8 g_oaid[64];
+static char g_oaid[64];
 static bool g_oaid_set;
 static bool g_oapply;
 static atomic64_t g_oaid_cand = ATOMIC64_INIT(0);
@@ -684,9 +684,15 @@ WRITE_ONCE(g_enable, false);
 drm_disarm_locked();
 mutex_unlock(&g_ctl_lock);
 } else if (!strncmp(buf, "oaid ", 5)) {
-pr_info("oaid cmd len=%u\n", (unsigned int)strlen(buf));
-if (drm_hex2bin(buf + 5, g_oaid, 64))
+int _i;
+if (strlen(buf) != 69)
 return -EINVAL;
+for (_i = 0; _i < 64; _i++) {
+char _c = buf[5 + _i];
+if (!((_c >= '0' && _c <= '9') || (_c >= 'a' && _c <= 'f') || (_c >= 'A' && _c <= 'F')))
+return -EINVAL;
+}
+memcpy(g_oaid, buf + 5, 64);
 WRITE_ONCE(g_oaid_set, true);
 pr_info("oaid target set\n");
 } else if (!strcmp(buf, "oapply 1")) {
