@@ -724,8 +724,9 @@ do_restore() {
   # 状态文件一起清：否则重启前面板仍按旧样本显示虚拟值，看着像没还原
   rm -f "$STATE/ssaid.current" "$STATE/ssaid.target" "$STATE/ssaid_map.tsv" \
         "$STATE/status.cache" "$STATE/pending_reboot"
-  # 只复位总开关状态；config 里的目标值保留，方便「重新开启」时按原配置再次应用
-  conf_set MASTER 0
+  # 面板已去掉总开关：这里只停用「开机自动应用」，配置里的目标值保留，
+  # 想恢复伪装把 AUTO_APPLY 改回 1（或重启后手动 apply）即可
+  conf_set AUTO_APPLY 0
   sk=""
   { [ -f /data/system/oaid_persistence_0 ] || [ -f "$BACKUP/oaid_persistence_0" ]; } || sk="$sk\"oaid\","
   { [ -f /data/system/app_set_ids.xml ] || [ -f "$BACKUP/app_set_ids.xml" ]; } || sk="$sk\"appset\","
