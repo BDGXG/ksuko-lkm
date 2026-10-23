@@ -34,5 +34,15 @@ esac
 printf 'Content-Type: application/json; charset=utf-8\r\n'
 printf 'Cache-Control: no-store\r\n'
 printf 'X-Content-Type-Options: nosniff\r\n'
+# CORS：只对 KSU WebUI / 本机来源回显 Origin。
+# KSU 模块卡片打开面板时页面来源是 https://mui.kernelsu.org，
+# 请求 127.0.0.1:16667 属于跨域，没有 ACAO 会被浏览器拦掉（面板卡在“检测中”）。
+# 其他站点拿不到 ACAO，浏览器不会放行读取响应。
+_o="${HTTP_ORIGIN:-}"
+case "$_o" in
+  https://mui.kernelsu.org*|http://mui.kernelsu.org*|https://kernelsu.org*)
+    printf 'Access-Control-Allow-Origin: %s\r\n' "$_o"
+    printf 'Vary: Origin\r\n' ;;
+esac
 printf '\r\n'
 printf '%s' "$OUT"
