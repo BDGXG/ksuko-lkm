@@ -79,3 +79,43 @@ OAID 保持“**只能轮换、不能指定**”：
 - panel「广告标识 → 随机」= 调 OPLUS 接口 rotate，返回值记录在 `state/oaid.current`
 - 注意 rotate 后应用缓存不会立即刷新，面板优先显示 rotate 返回值
 - 涉及 /proc 命令时 **绝不要把 `haluid` 设为 0**（见 `drm-guard.md` 第 4 节）
+
+---
+
+# 附：QIMEI 实测（2026-10-23）
+
+腾讯 QIMEI SDK 会把自己的结果缓存在应用私有目录：
+
+```
+/data/data/<pkg>/shared_prefs/QV1com.tencent.tdm.qimei.sdk.QimeiSDK*.xml
+  <string name="tt">B87B47FD765E9A1ED63F7B5A944581A5</string>   ← QIMEI 本体（32 hex）
+/data/data/<pkg>/files/qm/QV1com.tencent.tdm.qimei.sdk.QimeiSDK*
+```
+
+## A/B/C 对照实验（同一台设备、同一账号）
+
+| 组 | 操作 | QIMEI |
+|---|---|---|
+| A | 原始 | `B87B47FD765E9A1ED63F7B5A944581A5` |
+| B | rotate OAID 后清缓存 | `78511BDAE9238A0EDDF313DDB7E1D9FF` |
+| C | **不改任何字段**，只清缓存 | `58EBC5E4FC8CB47A2CD71BDC3C7FFAD4` |
+
+A ≠ B ≠ C，且 **C 在字段完全没变的情况下也变了**。
+
+## 结论
+
+1. **QIMEI 不是设备字段的哈希**。缓存缺失时 SDK 会重新生成一个新值，与 OAID/SSAID/Serial 当前值无关。
+2. 所以“需要改一堆标识才能换 QIMEI”这个假设 **不成立**；换 QIMEI 只需：
+   ```sh
+   am force-stop <pkg>
+   find /data/data/<pkg> -maxdepth 3 -iname '*qimei*' -exec rm -f {} \;
+   # 冷启动应用
+   ```
+   不需要重启，也不需要动任何标识。
+3. 因此 QIMEI 也不是“改不动的稳定输入”，真正的稳定锚点是 **账号**（OpenID / 微信 / QQ）。
+
+## 风险（重要）
+
+- QIMEI 的设计意图是**稳定的设备标识**，正常设备一辈子只有少数几个值。
+  同一账号短期内出现多个 QIMEI，本身就是异常特征，比“设备指纹全真”更容易命中风控。
+- 正确用法是 **在需要彻底重置环境时清一次**（换账号、换环境重开），而不是频繁清。
