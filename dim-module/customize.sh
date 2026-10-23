@@ -94,6 +94,14 @@ if [ -x "$MODPATH/bin/dim" ]; then
   [ -x "$MODPATH/bin/httpd_ctl.sh" ] || chmod 0755 "$MODPATH/bin/httpd_ctl.sh" 2>/dev/null
   sh "$MODPATH/bin/httpd_ctl.sh" start >/dev/null 2>&1
   ui_print "- 面板已启动: http://127.0.0.1:16667/"
+  # 安装后直接加载内核模块并下发 DRM，不必等重启；没有它 DRM 一直不生效
+  sh "$MODPATH/bin/ko.sh" >/dev/null 2>&1
+  if [ -e /proc/susfs_drm_guard ]; then
+    sh "$MODPATH/bin/dim" drm >/dev/null 2>&1
+    ui_print "- 内核模块已加载，DRM 配置已下发"
+  else
+    ui_print "- ! 内核模块未加载（可能需重启），DRM 暂不生效"
+  fi
 fi
 
 ui_print "- 完成。命令: sh /data/adb/modules/dim/bin/dim status"
