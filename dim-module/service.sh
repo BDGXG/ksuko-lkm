@@ -56,6 +56,13 @@ if [ -n "$(conf_get DRM_PKGS)" ] && [ -z "$(conf_get DRM_UIDS)" ]; then
 fi
 
 # 2) DRM 下发（hideguard 的内核节点）
+# identity.json 丢了但内核已有 id：落盘一份，保证面板能显示目标值
+if [ ! -s "$STATE/identity.json" ] && [ -e "$DRM_PROC" ]; then
+  _did=$(sed -n 's/^id=//p' "$DRM_PROC" 2>/dev/null | head -1)
+  [ -n "$_did" ] && printf '{"serial":"","drmid":"%s"}\n' "$_did" > "$STATE/identity.json" 2>/dev/null \
+    && log "identity.json restored from kernel id"
+fi
+
 if [ -e "$DRM_PROC" ] && [ "$(conf_get DRM_AUTO)" = "1" ]; then
   id=$(sed -n 's/.*"drmid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE/identity.json" 2>/dev/null | head -1)
   uids=$(conf_get DRM_UIDS)
