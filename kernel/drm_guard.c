@@ -61,7 +61,6 @@ atomic64_t e_scan, e_gate, e_write;
 atomic64_t kaddr_hits;
 };
 
-static int g_probe_hits;
 static struct drm_stats g_stats;
 
 static bool drm_uid_allowed(void)
@@ -203,8 +202,7 @@ atomic64_inc(&g_stats.r_ge8);
 if (td.data_size == 40)
 atomic64_inc(&g_stats.r_sz40);
 atomic64_inc(&g_stats.reply_seen);
-if (!drm_try_patch(&td))
-                drm_patch_write_parcel_loose(&td);
+drm_try_patch(&td);
 }
 off += step;
 }
@@ -303,14 +301,6 @@ static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td)
         if (!nz)
             continue;
 
-        if (g_probe_hits < 6) {
-            g_probe_hits++;
-            pr_info("probe hit p=%zu dsz=%zu off=%zu dt=%u len=%u b0=%02x%02x%02x%02x b8=%02x%02x%02x%02x\n",
-                    (size_t)pos, (size_t)td->data_size, (size_t)td->offsets_size,
-                    status, len, head[0], head[1], head[2], head[3],
-                    head[8], head[9], head[10], head[11]);
-        }
-
         atomic64_inc(&g_stats.w_cand);
         if (!READ_ONCE(g_apply)) {
             atomic64_inc(&g_stats.would_write);
@@ -377,7 +367,11 @@ break;
 if (cmd == BC_TRANSACTION) {
 if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
 break;
-if (td.code == 11) {
+/* 不再按事务码过滤：DRM 的 code 不是 11，原先的门槛让 HAL 侧回复永远被
+     * w_skipped 挡掉。现在对白名单 uid 的任何请求都开一个 60s 窗口，
+     * 回复侧仍要求 [status=0][len=32] + 32 字节非零才写。 */
+    (void)td.code;
+    {
 WRITE_ONCE(g_pending, jiffies);
 atomic64_inc(&g_stats.req_seen);
 }
