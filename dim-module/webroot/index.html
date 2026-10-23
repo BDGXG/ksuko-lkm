@@ -431,7 +431,7 @@
 <main class="app-shell">
 
   <section class="hero-card">
-    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2193</span></p>
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-2195</span></p>
     <h1>统一管理，<span>标识干净可控。</span></h1>
     <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
     <div class="hero-device" id="devline">读取中…</div>
@@ -744,6 +744,33 @@ async function doStatus() {
   curOf("curSsaid", "androidid");
   curOf("curDrm", "drmid");
   if ($("drmStat")) doDrmStats();
+
+// apps.json 可能还没生成（刚装完/刚开机）：后台补一次并重绘芯片，
+// 否则目标应用只能显示包名首字母
+if (!apps.length) {
+  loadApps(true).then(function () {
+    if (apps.length) { renderDrmChips(); renderPkgChips(); }
+    kickIcons();
+  }).catch(function () {});
+} else {
+  kickIcons();
+}
+
+// apps.json 只是 pm 快列表时（label=包名、无图标），后台跑一次提取并把名字＋图标补上；
+// 每次页面加载只跑一次，避免反复扫 proot
+function kickIcons() {
+  if (window.__iconsKicked) return;
+  if (!apps.some(function (a) { return !a.icon; })) return;
+  window.__iconsKicked = 1;
+  api("apps").then(function (v) {
+    try {
+      const l = JSON.parse(v);
+      if (Array.isArray(l) && l.length) {
+        apps = l; rebuildMaps(); renderDrmChips(); renderPkgChips();
+      }
+    } catch (e) {}
+  }).catch(function () {});
+}
 }
 
 function renderTargets() {
