@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f7f8fa">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>设备标识</title>
+<style>
+  :root{
+    --bg:#f7f8fa;
+    --surface:#ffffff;
+    --surface-muted:#f1f3f6;
+    --text:#172033;
+    --muted:#667085;
+    --subtle:#98a2b3;
+    --line:#e4e7ec;
+    --sub:#667085;
+    --primary:#2563eb;
+    --primary-strong:#1d4ed8;
+    --primary-soft:#eff6ff;
+    --success:#07875b;
+    --success-soft:#ecfdf3;
+    --warning:#b54708;
+    --warning-soft:#fffaeb;
+    --danger:#d92d20;
+    --danger-soft:#fff1f0;
+    --violet:#6941c6;
+    --shadow-sm:0 1px 2px rgba(16,24,40,.04);
+    --shadow-md:0 8px 24px rgba(16,24,40,.08);
+    --shadow-lg:0 22px 60px rgba(16,24,40,.16);
+    --radius:14px;
+    --radius-sm:10px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{
+    background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    padding-bottom:calc(32px + env(safe-area-inset-bottom));
+  }
+
+  /* 顶部毛玻璃导航 */
+  .topbar{
+    position:sticky;top:0;z-index:20;
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    min-height:58px;padding:9px max(16px,env(safe-area-inset-left)) 9px max(16px,env(safe-area-inset-right));
+    border-bottom:1px solid rgba(228,231,232,.84);
+    background:rgba(247,248,250,.86);
+    backdrop-filter:blur(18px) saturate(140%);
+  }
+  .brand{display:flex;align-items:center;gap:10px;min-width:0}
+  .brand-mark{
+    position:relative;width:40px;height:40px;flex:0 0 auto;border-radius:12px;
+    background:linear-gradient(135deg,#2f6bff,#4f46e5);
+    box-shadow:0 4px 11px rgba(37,99,235,.30), inset 0 1px 0 rgba(255,255,255,.22);
+    display:grid;place-items:center;
+  }
+  .brand-mark svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+  .brand strong{display:block;font-size:14px;font-weight:700;white-space:nowrap}
+  .brand span{display:block;margin-top:1px;color:var(--subtle);font-size:9px;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}
+  .status-pill{
+    display:inline-flex;align-items:center;gap:7px;min-height:35px;
+    border:1px solid var(--line);border-radius:999px;
+    background:var(--surface);color:var(--muted);
+    padding:6px 12px;box-shadow:var(--shadow-sm);
+    font-size:12px;font-weight:700;flex:0 0 auto;
+  }
+  .status-pill.ok{color:var(--success);border-color:rgba(7,135,91,.26)}
+  .pulse{width:7px;height:7px;border-radius:50%;background:var(--subtle)}
+  .status-pill.ok .pulse{background:var(--success);box-shadow:0 0 0 4px rgba(7,135,91,.12)}
+
+  .app-shell{padding:12px max(12px,env(safe-area-inset-left)) 0 max(12px,env(safe-area-inset-right));max-width:640px;margin:0 auto}
+
+  /* Hero */
+  .hero-card{
+    border:1px solid var(--line);border-radius:var(--radius);
+    background:var(--surface);box-shadow:var(--shadow-md);
+    padding:20px;margin-bottom:16px;position:relative;overflow:hidden;
+  }
+  .hero-card::before{
+    content:"";position:absolute;top:0;left:0;right:0;height:3px;
+    background:linear-gradient(90deg,var(--primary),var(--violet));
+  }
+  .eyebrow{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--primary);margin-bottom:8px}
+  .hero-card h1{font-size:22px;font-weight:760;letter-spacing:-.03em;line-height:1.25;margin-bottom:6px}
+  .hero-card h1 span{color:var(--primary)}
+  .hero-card p{color:var(--muted);font-size:13px;line-height:1.6}
+  .hero-device{
+    display:block;margin-top:12px;padding:7px 12px;border-radius:999px;
+    border:1px solid var(--line);background:var(--surface-muted);
+    font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+
+  /* 概览网格 */
+  .overview-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+  .overview-card{
+    display:flex;align-items:center;gap:11px;padding:14px;
+    border:1px solid var(--line);border-radius:var(--radius-sm);
+    background:var(--surface);box-shadow:var(--shadow-sm);
+  }
+  .overview-card.overview-primary{background:var(--primary-soft);border-color:rgba(37,99,235,.2)}
+  .overview-icon{display:grid;place-items:center;width:36px;height:36px;flex-shrink:0;border-radius:10px}
+  .icon-blue{background:var(--primary-soft);color:var(--primary)}
+  .icon-green{background:var(--success-soft);color:var(--success)}
+  .icon-violet{background:rgba(105,65,198,.12);color:var(--violet)}
+  .icon-amber{background:var(--warning-soft);color:var(--warning)}
+  .overview-card>div:last-child{min-width:0;flex:1}
+  .overview-card span{display:block;font-size:11px;color:var(--muted);margin-bottom:2px}
+  .overview-card strong{display:block;font-size:15px;font-weight:740;letter-spacing:-.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .overview-card small{display:block;font-size:10px;color:var(--subtle);margin-top:1px}
+
+  /* 分区标题 */
+  .section-block{margin-bottom:16px}
+  .section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .section-heading>div{display:flex;align-items:flex-start;gap:11px}
+  .section-index{
+    display:grid;place-items:center;width:28px;height:28px;flex-shrink:0;border-radius:8px;
+    background:var(--surface);border:1px solid var(--line);color:var(--primary);
+    font-size:11px;font-weight:800;
+  }
+  .section-heading h2{font-size:16px;font-weight:720;letter-spacing:-.02em}
+  .section-heading p{font-size:12px;color:var(--muted);margin-top:2px;line-height:1.5}
+  .section-heading .chip{
+    font-size:11px;font-weight:700;color:var(--muted);background:var(--surface);
+    border:1px solid var(--line);border-radius:999px;padding:4px 10px;white-space:nowrap;flex:0 0 auto;
+  }
+
+  .card{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow-sm);overflow:hidden}
+  .card-bd{padding:14px 16px}
+  .card-ft{padding:12px 16px;border-top:1px solid var(--line)}
+
+  /* 标识行 */
+  .line{display:flex;align-items:center;gap:10px;padding:11px 16px;min-height:48px}
+  .line+.line{border-top:1px solid var(--line)}
+  .line .n{font-size:14px;font-weight:600;flex:0 0 auto}
+  .line .v{
+    flex:1;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .st{width:7px;height:7px;border-radius:50%;background:#c9ced6;flex:0 0 auto}
+  .cgtag{
+    flex:0 0 auto;font-size:9.5px;font-weight:700;letter-spacing:.02em;
+    color:var(--violet);background:rgba(105,65,198,.12);
+    border-radius:5px;padding:2px 5px;line-height:1.35;
+  }
+  .nrtag{
+    flex:0 0 auto;font-size:9.5px;font-weight:700;letter-spacing:.02em;
+    color:var(--warning);background:var(--warning-soft);
+    border-radius:5px;padding:2px 5px;line-height:1.35;
+  }
+  .rbtag{
+    flex:0 0 auto;font-size:9.5px;font-weight:700;letter-spacing:.02em;
+    color:var(--primary);background:var(--primary-soft);
+    border-radius:5px;padding:2px 5px;line-height:1.35;
+  }
+  .st.ok{background:var(--success)}
+  .st.pd{background:var(--warning)}
+  .del{
+    flex:0 0 auto;border:0;border-radius:8px;padding:5px 10px;
+    background:var(--danger-soft);color:var(--danger);
+    font-size:12px;font-weight:600;font-family:inherit;
+  }
+
+  /* 标识卡片：原值 / 当前 / 待应用 */
+  .idcard{padding:12px 16px}
+  .idcard+.idcard{border-top:1px solid var(--line)}
+  .ihd{display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+  .ihd b{font-size:13.5px;font-weight:700}
+  .bdg{font-size:9.5px;font-weight:700;border-radius:5px;padding:2px 6px;line-height:1.35;
+       background:var(--surface-muted);color:var(--muted)}
+  .bdg.ok{background:var(--success-soft);color:var(--success)}
+  .bdg.pd{background:var(--warning-soft);color:var(--warning)}
+  .irow{display:flex;align-items:center;gap:8px;padding:3px 0}
+  .irow .k{flex:0 0 46px;font-size:11px;color:var(--subtle)}
+  .irow .v{flex:1;min-width:0;font-family:var(--mono);font-size:11.5px;color:var(--text);
+           word-break:break-all;line-height:1.45}
+  .irow .v.pendingval{color:var(--warning)}
+  .copybtn{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);color:var(--muted);
+           border-radius:7px;padding:4px 9px;font-size:10.5px;font-family:inherit;cursor:pointer}
+  .copybtn.ghost{border:0;background:transparent;width:0;padding:0}
+  /* 卡片内的单项操作区 */
+  .cdtools{padding:12px 16px 14px;border-top:1px solid var(--line);background:var(--surface)}
+  .cdtools .field{margin-bottom:10px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip-lite{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text);
+    background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 9px}
+  .chip-lite.muted{color:var(--subtle)}
+  .chip-lite i{font-style:normal;color:var(--subtle);cursor:pointer;font-size:13px;line-height:1}
+  .lbl-r{float:right;font-weight:600;color:var(--subtle);font-size:11px}
+  .addbtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;margin:0;
+    border-radius:9px;background:var(--primary-soft);color:var(--primary);font-style:normal;
+    font-size:22px;line-height:1;font-weight:600;cursor:pointer}
+  .orow{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    margin-top:10px;font-size:12.5px;color:var(--muted)}
+  details.mini>summary{list-style:none;cursor:pointer;font-size:12px;color:var(--muted);
+    display:flex;align-items:center;gap:6px}
+  details.mini>summary::-webkit-details-marker{display:none}
+  details.mini>summary:before{content:"\203a";font-size:14px;line-height:1;transition:.2s}
+  details.mini[open]>summary:before{transform:rotate(90deg)}
+  .ihead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:32px}
+  .ihead .chips{flex:0 1 auto}
+  .appico{display:inline-flex;width:32px;height:32px;border-radius:9px;overflow:hidden;cursor:pointer;
+    border:1px solid var(--line);background:var(--surface)}
+  .appico img{width:100%;height:100%;object-fit:cover}
+  .appico .noic{width:100%;height:100%;display:grid;place-items:center;background:var(--line);
+    color:var(--muted);font-size:13px;font-weight:700}
+  .appchip{display:inline-flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--line);
+    border-radius:10px;padding:6px 10px;max-width:100%}
+  .appchip img{width:22px;height:22px;border-radius:6px;flex:0 0 auto}
+  .appchip .noic{width:22px;height:22px;border-radius:6px;background:var(--line);color:var(--muted);
+    font-size:11px;display:grid;place-items:center;flex:0 0 auto}
+  .appchip b{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
+  .appchip s{text-decoration:none;font-size:10.5px;color:var(--subtle);font-family:var(--mono);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}
+  .appchip i,.chip-x{font-style:normal;color:var(--subtle);cursor:pointer;font-size:15px;line-height:1;padding-left:2px}
+  .hdact{margin-left:auto;display:flex;gap:6px;flex:0 0 auto}
+  .hdbtn{border:1px solid var(--line);background:var(--surface-muted);color:var(--text);
+         border-radius:7px;padding:3px 8px;font-size:10.5px;font-family:inherit;cursor:pointer}
+  .hdbtn.danger{color:var(--danger);background:var(--danger-soft);border-color:rgba(217,45,32,.22)}
+  .hdbtn[disabled]{opacity:.4}
+
+  /* 总开关 */
+  .master{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .opt{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+  .opt .mt{flex:1;min-width:0}
+  .opt .mt b{display:block;font-size:13px;font-weight:600}
+  .opt .mt s{display:block;text-decoration:none;font-size:11px;color:var(--muted);margin-top:1px}
+  .master .mt{flex:1;min-width:0}
+  .master .mt b{display:block;font-size:14px;font-weight:700}
+  .master .mt s{display:block;text-decoration:none;font-size:11.5px;color:var(--muted);margin-top:1px}
+  .sw{position:relative;width:46px;height:27px;flex:0 0 auto}
+  .sw input{display:none}
+  .sw i{position:absolute;inset:0;background:#d5dae1;border-radius:99px;transition:.2s}
+  .sw i:after{content:"";position:absolute;left:3px;top:3px;width:21px;height:21px;border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+  .sw input:checked+i{background:var(--success)}
+  .sw input:checked+i:after{left:22px}
+
+  /* 按钮 */
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    padding:10px 16px;border-radius:10px;border:1px solid transparent;
+    font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;
+    transition:all .15s;white-space:nowrap;background:none;color:var(--text);
+  }
+  .btn:active{transform:scale(.98)}
+  .btn-primary{background:var(--primary);color:#fff}
+  .btn-gray{background:var(--surface-muted);color:var(--text);border-color:var(--line)}
+  .btn-danger{background:var(--danger-soft);color:var(--danger)}
+  .btn-full{width:100%}
+  .btn-sm{padding:8px 12px;font-size:12.5px;border-radius:9px}
+  .btn-row{display:flex;gap:8px}
+  .btn-row .btn{flex:1}
+  .btn-desc{display:block;font-size:11px;color:var(--muted);margin-top:2px;font-weight:400}
+  .btn-primary .btn-desc{color:rgba(255,255,255,.78)}
+
+  /* 折叠面板 */
+  .acc{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow-sm);overflow:hidden}
+  .acc>summary{
+    list-style:none;display:flex;align-items:center;gap:10px;
+    padding:14px 16px;cursor:pointer;
+  }
+  .acc>summary::-webkit-details-marker{display:none}
+  .acc>summary .ttl{font-size:14px;font-weight:700;flex:0 0 auto}
+  .acc>summary .cur{flex:1;text-align:right;font-family:var(--mono);font-size:11px;color:var(--subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .acc>summary .chev{
+    width:8px;height:8px;flex:0 0 auto;margin-left:2px;
+    border-right:1.8px solid var(--subtle);border-bottom:1.8px solid var(--subtle);
+    transform:rotate(45deg);transition:.2s;
+  }
+  .acc[open]>summary .chev{transform:rotate(-135deg)}
+  .acc[open]>summary{border-bottom:1px solid var(--line)}
+  .acc-bd{padding:14px 16px}
+
+  .field{margin-bottom:12px}
+  .field:last-child{margin-bottom:0}
+  .field label{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:6px}
+  .field input{
+    width:100%;background:var(--surface-muted);border:1px solid var(--line);
+    border-radius:10px;padding:10px 12px;font-size:13px;color:var(--text);
+    outline:none;font-family:var(--mono);
+  }
+  .field input:focus{border-color:var(--primary);background:var(--surface)}
+  .field input::placeholder{color:var(--subtle);font-family:-apple-system,sans-serif}
+
+  /* 新手引导 */
+  .welcome{
+    border-color:rgba(37,99,235,.24);
+    background:linear-gradient(180deg,var(--primary-soft),var(--surface) 72%);
+  }
+  .welcome .wt{font-size:15px;font-weight:740;letter-spacing:-.02em;margin-bottom:12px}
+  .steps{display:flex;flex-direction:column;gap:11px;margin-bottom:14px}
+  .step{display:flex;gap:10px;align-items:flex-start}
+  .step-num{
+    width:22px;height:22px;flex:0 0 auto;margin-top:1px;border-radius:50%;
+    background:var(--primary);color:#fff;font-size:11px;font-weight:800;
+    display:grid;place-items:center;
+  }
+  .step b{display:block;font-size:13px;font-weight:700}
+  .step p{font-size:11.5px;color:var(--muted);margin-top:1px;line-height:1.5}
+  .hint{font-size:11px;color:var(--muted);line-height:1.55;margin-top:8px}
+  .hint.warn{color:var(--warning)}
+  .hint-list{margin:8px 0 0;padding-left:15px;font-size:11px;color:var(--muted);line-height:1.6}
+  .hint-list li{margin-top:3px}
+  .hint-list b{color:var(--text);font-weight:600}
+  .hint-list .no{color:var(--warning);font-weight:600}
+
+  /* 独立修改分组（同一卡片内分区，不拆开） */
+  .grp{padding:14px 16px}
+  .grp+.grp{border-top:1px solid var(--line)}
+  .grp-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+  .grp-head b{font-size:14px;font-weight:700;flex:0 0 auto}
+  .grp-head .tag{
+    font-size:10px;font-weight:700;color:var(--primary);background:var(--primary-soft);
+    border-radius:6px;padding:2px 6px;flex:0 0 auto;
+  }
+  .grp-head .cur{
+    margin-left:auto;min-width:0;font-family:var(--mono);font-size:11px;color:var(--subtle);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;
+  }
+
+  /* 日志 */
+  .log{
+    font-size:12px;background:var(--surface-muted);border:1px solid var(--line);
+    color:var(--muted);padding:12px;border-radius:10px;line-height:1.6;
+    max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+    font-family:var(--mono);
+  }
+  .empty{padding:20px 16px;text-align:center;color:var(--subtle);font-size:13px}
+
+  /* 底部弹窗 */
+  .sheet{position:fixed;inset:0;background:rgba(16,24,40,.5);display:none;align-items:flex-end;z-index:99}
+  .sheet.show{display:flex}
+  .sheet-body{
+    background:var(--surface);width:100%;border-radius:16px 16px 0 0;
+    max-height:85vh;display:flex;flex-direction:column;
+    padding-bottom:calc(14px + env(safe-area-inset-bottom));
+  }
+  .sheet-head{display:flex;align-items:center;justify-content:space-between;padding:16px;border-bottom:1px solid var(--line)}
+  .sheet-head .t{font-size:17px;font-weight:700}
+  .sheet-head button{border:none;background:none;color:var(--primary);font-size:15px;font-weight:600;font-family:inherit;cursor:pointer}
+  .search{
+    margin:12px 16px;padding:10px 12px;background:var(--surface-muted);
+    border:1px solid var(--line);border-radius:10px;font-size:14px;color:var(--text);
+    width:calc(100% - 32px);outline:none;font-family:inherit;
+  }
+  .alist{overflow:auto;flex:1;padding:0 16px;min-height:120px}
+  .arow{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px;cursor:pointer}
+  .arow:last-child{border-bottom:none}
+  .arow img{width:36px;height:36px;border-radius:10px;background:var(--surface-muted);flex:0 0 auto;object-fit:cover}
+  .arow .p{flex:1;min-width:0}
+  .arow .p b{display:block;font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .arow .p s{display:block;text-decoration:none;font-size:10.5px;color:var(--muted);font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .arow .u{font-size:11px;color:var(--subtle);font-family:var(--mono);flex:0 0 auto}
+  .arow .ck{width:22px;height:22px;border-radius:50%;border:2px solid var(--line);flex:0 0 auto;position:relative}
+  .arow .ck.on{background:var(--primary);border-color:var(--primary)}
+  .arow .ck.on:after{content:"";position:absolute;left:6px;top:3px;width:6px;height:11px;
+    border-right:2px solid #fff;border-bottom:2px solid #fff;transform:rotate(45deg)}
+
+  /* 确认弹窗 */
+  .mask{position:fixed;inset:0;background:rgba(16,24,40,.5);display:none;align-items:center;justify-content:center;padding:22px;z-index:100}
+  .mask.show{display:flex}
+  .dlg{background:var(--surface);border-radius:16px;padding:20px;max-width:340px;width:100%;box-shadow:var(--shadow-lg)}
+  .dlg h3{margin:0 0 8px;font-size:16px;font-weight:720;letter-spacing:-.02em}
+  .dlg p{margin:0 0 16px;font-size:13px;color:var(--muted);white-space:pre-line;line-height:1.6}
+  .dbtns{display:flex;gap:8px}
+  .dbtns button{flex:1;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--surface-muted);color:var(--text);font-size:13.5px;font-weight:600;font-family:inherit;cursor:pointer}
+  .dbtns button.pri{background:var(--primary);border-color:var(--primary);color:#fff}
+  .dbtns button.dz{background:var(--danger-soft);border-color:rgba(217,45,32,.2);color:var(--danger)}
+
+  .toast{
+    position:fixed;left:50%;bottom:26px;transform:translateX(-50%);
+    background:#172033;color:#fff;padding:10px 18px;border-radius:999px;
+    font-size:13px;opacity:0;transition:.25s;pointer-events:none;max-width:86vw;
+    z-index:200;box-shadow:var(--shadow-md);
+  }
+  .toast.show{opacity:.96}
+
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0e1014;--surface:#171a20;--surface-muted:#1e222a;
+      --text:#e7e9ec;--muted:#98a2b3;--subtle:#6f7683;--line:#262b34;--sub:#98a2b3;
+      --primary-soft:rgba(37,99,235,.16);--success-soft:rgba(7,135,91,.16);
+      --warning-soft:rgba(181,71,8,.18);--danger-soft:rgba(217,45,32,.16);
+      --shadow-sm:0 1px 2px rgba(0,0,0,.4);--shadow-md:0 8px 24px rgba(0,0,0,.5);
+      --shadow-lg:0 22px 60px rgba(0,0,0,.6);
+    }
+    .topbar{background:rgba(14,16,20,.86);border-bottom-color:rgba(38,43,52,.9)}
+    .sw i{background:#39404b}
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        <rect x="3" y="5" width="18" height="14" rx="3"/>
+        <circle cx="9" cy="12" r="2.1"/>
+        <path d="M14.5 10.2h3.2M14.5 13.8h3.2M6.6 15.4c.7-1.1 1.6-1.6 2.4-1.6s1.7.5 2.4 1.6"/>
+      </svg>
+    </span>
+    <div>
+      <strong>设备标识</strong>
+      <span>Device Identity</span>
+    </div>
+  </div>
+  <div class="status-pill" id="statusPill">
+    <span class="pulse" id="dot"></span>
+    <span id="statusText">检测中…</span>
+  </div>
+</header>
+
+<main class="app-shell">
+
+  <section class="hero-card">
+    <p class="eyebrow">DEVICE IDENTITY · <span id="verTag">v1.2.0-1960</span></p>
+    <h1>统一管理，<span>标识干净可控。</span></h1>
+    <p>Serial、Android ID、OAID、DRM ID 一站式下发与还原。DRM 走内核节点按 UID 精确注入，其余项落地即生效。</p>
+    <div class="hero-device" id="devline">读取中…</div>
+  </section>
+
+  <section class="overview-grid">
+    <div class="overview-card overview-primary">
+      <div class="overview-icon icon-blue">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2 19 6v5.1c0 4.5-2.8 8-7 9.7-4.2-1.7-7-5.2-7-9.7V6l7-2.8Z"/><path d="m8.8 12 2.1 2.1 4.5-4.5"/></svg>
+      </div>
+      <div>
+        <span>总开关</span>
+        <strong id="mState">—</strong>
+        <small>标识管理状态</small>
+      </div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-icon icon-violet">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </div>
+      <div>
+        <span>目标应用</span>
+        <strong id="mTargets">—</strong>
+        <small>DRM 作用范围</small>
+      </div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-icon icon-green">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      </div>
+      <div>
+        <span>DRM 钩子</span>
+        <strong id="mDrm">—</strong>
+        <small>内核节点状态</small>
+      </div>
+    </div>
+    <div class="overview-card">
+      <div class="overview-icon icon-amber">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 14 4-4 4 4 5-5"/></svg>
+      </div>
+      <div>
+        <span>已生效标识</span>
+        <strong id="mIds">—</strong>
+        <small>状态为 applied</small>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-block" id="welcomeBlock">
+    <div class="card welcome">
+      <div class="card-bd">
+        <div class="wt">第一次用？三步搞定</div>
+        <div class="steps">
+          <div class="step"><span class="step-num">1</span><div><b>选应用</b><p>决定哪些应用读到新标识；不选就是全部应用。</p></div></div>
+          <div class="step"><span class="step-num">2</span><div><b>点「一键更换」</b><p>自动生成一整套 Serial / Android ID / OAID / DRM ID。</p></div></div>
+          <div class="step"><span class="step-num">3</span><div><b>重启生效</b><p>Android ID、OAID 需重启设备或重开被改的应用后才生效。</p></div></div>
+        </div>
+        <button class="btn btn-gray btn-sm btn-full" onclick="hideWelcome()">知道了，不再显示</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-block">
+    <div class="section-heading">
+      <div><span class="section-index">01</span><div><h2>当前状态</h2><p>模块是否生效，以及每一项的原值 / 当前值。</p></div></div>
+    </div>
+    <div class="card">
+      <div class="master">
+        <div class="mt"><b>总开关</b><s>关闭会还原可还原项，并停止开机自动应用</s></div>
+        <label class="sw"><input type="checkbox" id="master" onchange="toggleMaster(this)"><i></i></label>
+      </div>
+      <div id="list"></div>
+      <div class="card-ft"><div class="hint" style="margin:0">原值 = 首次备份的真值 · 当前 = 系统正在使用的值 · 徽章显示是否已写入</div></div>
+    </div>
+  </section>
+
+  <section class="section-block">
+    <div class="section-heading">
+      <div><span class="section-index">02</span><div><h2>一键更换</h2><p>新手只做这一步：选应用 → 点按钮 → 重启。</p></div></div>
+    </div>
+    <div class="card">
+      <div class="card-bd">
+        <button class="btn btn-primary btn-full" onclick="confirmDo('一键更换','为已选应用生成全新的一套标识：\nSerial / Android ID / OAID / DRM ID，并重置 AppSetID。\nAndroid ID 与 OAID 需重启生效。','randomize')">一键更换全部标识</button>
+        <div class="hint">会覆盖当前虚拟值。想撤销就去「高级设置 → 恢复原样」。</div>
+      </div>
+      <div class="grp">
+        <div class="grp-head"><b>作用于</b><span class="cur" id="tgtcount">全部应用</span></div>
+        <div id="targets"></div>
+      </div>
+      <div class="grp">
+        <div class="opt" style="border-top:0;padding-top:0"><div class="mt"><b>换完停掉目标应用</b><s>让它下次冷启动才读到新标识</s></div>
+          <label class="sw"><input type="checkbox" id="optStop" onchange="toggleOpt('stop',this)"><i></i></label></div>
+        <div class="opt"><div class="mt"><b>同时清 QIMEI 缓存</b><s>会重置腾讯设备 ID，慎用</s></div>
+          <label class="sw"><input type="checkbox" id="optQimei" onchange="toggleOpt('qimei',this)"><i></i></label></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-block">
+    <div class="section-heading">
+       <div><span class="section-index">03</span><div><h2>高级设置</h2><p>诊断日志、应用配置与还原。不确定就先别动。</p></div></div>
+    </div>
+    <details class="acc">
+      <summary><span class="ttl">展开高级设置</span> <span class="cur">诊断日志 · 应用配置 · 还原</span><span class="chev"></span></summary>
+      <div class="acc-bd" style="padding:0">
+
+        <div class="grp">
+          <div class="grp-head"><b>诊断与日志</b></div>
+          <div class="btn-row">
+            <button class="btn btn-gray btn-sm" onclick="doDrmInfo()">读取 DRM 节点</button>
+            <button class="btn btn-gray btn-sm" onclick="doLog()">读取运行日志</button>
+          </div>
+          <div class="log" id="drmraw" style="margin-top:10px">—</div>
+          <div class="log" id="logbox" style="margin-top:8px">—</div>
+        </div>
+
+        <div class="grp">
+          <div class="grp-head"><b>还原与重载</b></div>
+          <div class="btn-row">
+            <button class="btn btn-gray btn-sm" onclick="confirmDo('应用配置','按 config.conf 重新应用全部标识','apply')">应用配置</button>
+            <button class="btn btn-danger btn-sm" onclick="confirmDoRestore()">恢复原样</button>
+          </div>
+          <button class="btn btn-danger btn-sm btn-full" style="margin-top:8px" onclick="confirmDo('关闭 DRM 钩子','内核钩子将不再改写 deviceUniqueID，DRM ID 立即回到真值。','drm-off')">关闭 DRM 钩子</button>
+          <div class="hint warn">「恢复原样」会关闭总开关、还原可还原的标识，并停止开机自动应用。</div>
+          <ul class="hint-list">
+            <li>序列号：写回安装时记录的真值，<b>立即生效</b></li>
+            <li>安卓 ID：回拷 settings_ssaid.xml，<b>需重启</b>才生效</li>
+            <li>DRM ID：关闭内核钩子即回真值，<b>立即生效</b></li>
+            <li>广告标识：本机无 oaid_persistence 文件，<span class="no">无法还原</span></li>
+            <li>AppSetID：本机无 app_set_ids.xml，<span class="no">无法还原</span></li>
+          </ul>
+        </div>
+
+      </div>
+    </details>
+  </section>
+</main>
+
+<div class="mask" id="mask"><div class="dlg">
+  <h3 id="dlgTitle">确认</h3><p id="dlgMsg"></p>
+  <div class="dbtns"><button onclick="closeDlg(false)">取消</button>
+  <button class="pri" onclick="closeDlg(true)">确认</button></div>
+</div></div>
+
+<div class="sheet" id="pmask"><div class="sheet-body">
+  <div class="sheet-head">
+    <button onclick="closePicker()">取消</button>
+    <span class="t">选择应用</span>
+    <button onclick="applyPicker()" style="font-weight:700">完成</button>
+  </div>
+  <input class="search" id="pfilter" placeholder="搜索名称或包名" oninput="renderPicker()">
+  <div style="padding:0 16px 8px"><button class="btn btn-gray btn-sm btn-full" onclick="refreshApps()">刷新应用列表</button></div>
+  <div class="alist" id="alist"></div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+<script>
+function hideWelcome() {
+  try { localStorage.setItem("dim.seen", "1"); } catch (e) {}
+  var b = document.getElementById("welcomeBlock");
+  if (b) b.style.display = "none";
+}
+try {
+  if (localStorage.getItem("dim.seen") === "1") {
+    var b0 = document.getElementById("welcomeBlock");
+    if (b0) b0.style.display = "none";
+  }
+} catch (e) {}
+</script>
+<script src="app.js?v=20261023-1985"></script>
+</body>
+</html>

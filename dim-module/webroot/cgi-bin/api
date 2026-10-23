@@ -1,0 +1,34 @@
+#!/system/bin/sh
+# CGI：/cgi-bin/api?action=xxx  ->  dim CLI
+export PATH=/data/adb/ksu/bin:/system/bin:/system/xbin:/vendor/bin:$PATH
+MODDIR=/data/adb/modules/dim
+[ -d "$MODDIR" ] || MODDIR=/data/adb/modules_update/dim
+DIM="$MODDIR/bin/dim"
+
+Q="${QUERY_STRING:-}"
+ACT="${Q#action=}"
+ACT="${ACT%%&*}"
+VAL=""
+case "$Q" in
+  *value=*) VAL="${Q#*value=}"; VAL="${VAL%%&*}" ;;
+esac
+# 简单 URL 解码
+ACT=$(printf '%b' "${ACT//%/\\x}" 2>/dev/null | tr '+' ' ')
+VAL=$(printf '%b' "${VAL//%/\\x}" 2>/dev/null | tr '+' ' ')
+
+case "$ACT" in
+  status|apply|randomize|restore|log|drm-info|drm-off|drm|drm-stats|setmaster|serial-restore|drmid-rand|oaid|appset|baseline)
+       OUT=$(sh "$DIM" "$ACT") ;;
+  serial|ssaid|drmid|uids|haluid|conf|opt-stop|opt-qimei|opt-drmstop|drmpkgs)
+       OUT=$(sh "$DIM" "$ACT" "$VAL") ;;
+  apps)  OUT=$(sh "$MODDIR/bin/icons.sh" >/dev/null 2>&1; cat /data/adb/dim/apps.json 2>/dev/null) ;;
+  apps-cached) OUT=$(cat /data/adb/dim/apps.json 2>/dev/null) ;;
+  *)   OUT='{"ok":false,"error":"unknown action"}' ;;
+esac
+[ -n "$OUT" ] || OUT='{"ok":false,"error":"empty"}'
+
+printf 'Content-Type: application/json; charset=utf-8\r\n'
+printf 'Cache-Control: no-store\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf '\r\n'
+printf '%s' "$OUT"

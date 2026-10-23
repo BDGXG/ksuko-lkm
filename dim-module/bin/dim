@@ -1,0 +1,660 @@
+#!/system/bin/sh
+# 设备标识管理 v1.1 —— 用户态后端
+# 结构对齐 SKRoot：每个标识都有 original / current / target / state
+# 写盘类操作：改前备份 → 写后校验 → 失败自动回滚；uninstall/restore 可完全还原
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/bin}
+CONF_DIR=/data/adb/dim
+CONF="$CONF_DIR/config.conf"
+STATE="$CONF_DIR/state"
+BACKUP="$STATE/backup"
+LOG="$STATE/daemon.log"
+DRM_PROC=/proc/susfs_drm_guard
+OAID_JAR="$MODDIR/bin/oaid-runtime.jar"
+BB=/data/adb/ksu/bin/busybox
+[ -x "$BB" ] || BB=/system/bin/busybox
+
+mkdir -p "$STATE" "$BACKUP" 2>/dev/null
+
+for p in /data/adb/ksu/bin/resetprop "$MODDIR/bin/resetprop"; do
+  [ -x "$p" ] && RESETPROP="$p" && break
+done
+
+log()  {
+  # 超过 512KB 就保留最后 1000 行，避免无限增长
+  if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 524288 ]; then
+    tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+  fi
+  printf '[%s] %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+}
+esc()  { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+jget() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" 2>/dev/null | head -1; }
+
+rand_hex()    { od -An -tx1 -N "$1" /dev/urandom 2>/dev/null | tr -d ' \n'; }
+# 按“原始 serial 的形状”生成：长度一致、大小写一致，避免出现 16 位大写这种一眼假的串
+gen_serial()  {
+  _o=$(jget serial < "$STATE/original.json" 2>/dev/null)
+  _n=$(printf '%s' "$_o" | wc -c | tr -d ' ')
+  case "$_n" in ''|*[!0-9]*) _n=16 ;; esac
+  [ "$_n" -ge 4 ] 2>/dev/null || _n=16
+  _s=$(rand_hex $(( (_n + 1) / 2 )) | cut -c 1-"$_n")
+  case "$_o" in
+    *[a-z]*) printf '%s\n' "$_s" ;;
+    *)       printf '%s\n' "$_s" | tr 'a-f' 'A-F' ;;
+  esac
+}
+gen_aid()     { rand_hex 8; }
+# DRM 虚拟 ID：避开 Base64 里会出现 + / 的取值（DevCheck 用 Base64 显示，纯字母数字更清爽）
+gen_drmid()   {
+  _i=0
+  while [ "$_i" -lt 12 ]; do
+    _h=$(rand_hex 32)
+    if [ -x "$BB" ]; then
+      _b=$(printf '%s' "$_h" | "$BB" xxd -r -p 2>/dev/null | "$BB" base64 2>/dev/null | tr -d '\n')
+      case "$_b" in *[+/]*) _i=$((_i+1)); continue;; esac
+    fi
+    printf '%s\n' "$_h"
+    return
+  done
+  rand_hex 32
+}
+
+conf_get() { [ -f "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
+conf_set() {
+  mkdir -p "$CONF_DIR"
+  if [ -f "$CONF" ] && grep -q "^$1=" "$CONF" 2>/dev/null; then
+    sed -i "s|^$1=.*|$1=$2|" "$CONF"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$CONF"
+  fi
+}
+
+# ---------- 读取当前值 ----------
+prop_get() { [ -n "$RESETPROP" ] && "$RESETPROP" "$1" 2>/dev/null; }
+cur_serial() { prop_get ro.serialno; }
+cur_soc() { cat /sys/devices/soc0/serial_number 2>/dev/null | tr -d ' \n'; }
+cur_aid() {
+  # Android ID 有两条来源：settings_ssaid.xml（按应用，应用实际读这个）
+  # 与 settings get secure android_id（全局 legacy）。面板应显示前者。
+  v=$(head -1 "$STATE/ssaid.current" 2>/dev/null)
+  [ -n "$v" ] || v=$(ssaid_read /data/system/users/0/settings_ssaid.xml)
+  [ -n "$v" ] || v=$(/system/bin/settings get secure android_id 2>/dev/null | tr -d ' \n')
+  printf '%s\n' "$v"
+}
+# 从 ssaid 文件里取一个样本值（ABX 或纯 XML 都支持）
+ssaid_read() {
+  f="$1"; [ -f "$f" ] || return 1
+  tmp=/data/local/tmp/.ssaid_probe.xml
+  if [ "$(head -c 3 "$f" 2>/dev/null)" = "ABX" ]; then
+    /system/bin/abx2xml "$f" "$tmp" 2>/dev/null || return 1
+    src="$tmp"
+  else
+    src="$f"
+  fi
+  sed -n 's/.*name="[0-9][0-9]*" value="\([^"]*\)".*/\1/p' "$src" 2>/dev/null | head -1
+  rm -f "$tmp"
+}
+cur_oaid() {
+  # 0) rotate 拿到的值优先（那是 OPLUS 服务即将下发的新值）
+  v=$(head -1 "$STATE/oaid.current" 2>/dev/null)
+  [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+  # 1) 标准 MSA 持久化文件（部分 ROM 才有）
+  for f in /data/system/oaid_persistence_0 /data/system/oaid_persistence; do
+    if [ -f "$f" ]; then head -c 64 "$f" 2>/dev/null | tr -d ' \n'; return; fi
+  done
+  # 2) OPLUS/ColorOS：OAID 由 com.heytap.openid 运行时下发，无持久化文件，
+  #    回退读系统/第三方应用已缓存过的 OAID（JSON 中形如 id: <OAID>）
+  for f in \
+    /data/data/com.coloros.assistantscreen/shared_prefs/device_register_oaid_refine.xml \
+    /data/data/com.heytap.browser/shared_prefs/device_register_oaid_refine.xml \
+    /data/data/*/shared_prefs/umeng_sp_oaid.xml; do
+    [ -f "$f" ] || continue
+    v=$(grep -oE '[0-9A-Fa-f]{32,}' "$f" 2>/dev/null | head -1)
+    [ -z "$v" ] && v=$(grep -oE '[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z-]{8,}' "$f" 2>/dev/null | head -1)
+    [ -n "$v" ] && { echo "$v"; return; }
+  done
+  echo ""
+}
+oaid_state() { [ -n "$1" ] && echo ready || echo absent; }
+drm_get() { [ -e "$DRM_PROC" ] && awk -v k="$1" '{for(i=1;i<=NF;i++){split($i,p,"="); if(p[1]==k){print p[2]; exit}}}' "$DRM_PROC" 2>/dev/null; }
+drm_uids_list() { [ -e "$DRM_PROC" ] && sed -n 's/^ *uid\[[0-9]*\]=//p' "$DRM_PROC" 2>/dev/null | tr '\n' ',' | sed 's/,$//'; }
+
+# ---------- 备份 / 基线 ----------
+backup_once() {
+  [ -f "$1" ] || return 0
+  [ -f "$BACKUP/$2" ] && return 0
+  cp -p "$1" "$BACKUP/$2" 2>/dev/null && log "backup: $2"
+}
+baseline_once() {
+  [ -s "$STATE/baseline.json" ] && return 0
+  printf '{"serial":"%s","soc_serial":"%s","android_id":"%s","oaid":"%s","ts":"%s"}\n' \
+    "$(cur_serial)" "$(cur_soc)" "$(cur_aid)" "$(cur_oaid)" "$(date '+%F %T')" > "$STATE/baseline.json"
+  log "baseline captured"
+}
+baseline_get() { jget "$1" < "$STATE/baseline.json" 2>/dev/null; }
+
+# ---------- Serial ----------
+SERIAL_PROPS="ro.serialno ro.boot.serialno ro.vendor.serialno ro.vendor.oem.serialno
+ro.kernel.androidboot.serialno persist.sys.serialno ro.ril.oem.sno"
+prop_set() { [ -n "$RESETPROP" ] && "$RESETPROP" -n "$1" "$2" 2>>"$LOG"; }
+serial_apply() {
+  [ -n "$1" ] || return 1
+  for k in $SERIAL_PROPS; do prop_set "$k" "$1"; done
+  log "serial applied: $1"
+}
+
+# ---------- SSAID / AppSetID ----------
+fix_meta() {
+  chown system:system "$1" 2>/dev/null
+  chmod 0600 "$1" 2>/dev/null
+  /system/bin/restorecon "$1" 2>/dev/null
+}
+ssaid_edit() {
+  u="$1"; pkg="$2"; val="$3"
+  f="/data/system/users/$u/settings_ssaid.xml"
+  [ -f "$f" ] || { log "ssaid: no $f"; return 1; }
+  backup_once "$f" "ssaid.$u.xml"
+
+  abx=0
+  [ "$(head -c 3 "$f" 2>/dev/null)" = "ABX" ] && abx=1
+  if [ $abx -eq 1 ]; then
+    /system/bin/abx2xml "$f" "$f.xml" 2>>"$LOG" || return 1
+    wf="$f.xml"
+  else
+    wf="$f"
+  fi
+
+  c1=$(grep -c '<setting ' "$wf" 2>/dev/null)
+  oldvals=$(sed -n 's/.*name="[0-9][0-9]*" value="\([^"]*\)".*/\1/p' "$wf" 2>/dev/null | sort -u)
+  if [ "$pkg" = "*" ]; then
+    # 用安装时的备份建立 uid → 原始值 映射，再按“原始值分组”轮换：
+    # 既保留应用间原本的共享关系，也不会让所有应用变成同一个 SSAID
+    omap=/data/adb/dim/state/.ssaid.map
+    : > "$omap"
+    bak="$BACKUP/ssaid.$u.xml"
+    if [ -f "$bak" ]; then
+      src="$bak"
+      if [ "$(head -c 3 "$bak" 2>/dev/null)" = "ABX" ]; then
+        /system/bin/abx2xml "$bak" "$omap.xml" 2>>"$LOG" && src="$omap.xml"
+      fi
+      [ -f "$src" ] && sed -n 's/.*name="\([0-9][0-9]*\)" value="\([^"]*\)".*/\1 \2/p' "$src" > "$omap"
+      rm -f "$omap.xml"
+    fi
+    awk -v mf="$omap" '
+      BEGIN {
+        while ((getline l < mf) > 0) { split(l, a, " "); if (a[1] != "") byuid[a[1]] = a[2] }
+        srand()
+      }
+      function r16(  s, i, hex) {
+        hex = "0123456789abcdef"; s = ""
+        for (i = 0; i < 16; i++) s = s substr(hex, int(rand() * 16) + 1, 1)
+        return s
+      }
+      /<setting / && /name="[0-9]/ {
+        match($0, /name="[0-9]+"/); uid = substr($0, RSTART + 6, RLENGTH - 7)
+        grp = byuid[uid]; if (grp == "") grp = "#" uid
+        if (!(grp in m)) m[grp] = r16()
+        nv = m[grp]
+        sub(/value="[^"]*"/, "value=\"" nv "\"")
+        sub(/defaultValue="[^"]*"/, "defaultValue=\"" nv "\"")
+      }
+      { print }' "$wf" > "$wf.tmp" && mv -f "$wf.tmp" "$wf"
+    rm -f "$omap"
+  else
+    new="$val"; [ -n "$new" ] || new=$(gen_aid)
+    awk -v new="$new" -v pkg="$pkg" '
+      /<setting / && /name="[0-9]/ && index($0, "package=\"" pkg "\"") > 0 {
+        sub(/value="[^"]*"/, "value=\"" new "\"");
+        sub(/defaultValue="[^"]*"/, "defaultValue=\"" new "\"");
+      }
+      { print }' "$wf" > "$wf.tmp" && mv -f "$wf.tmp" "$wf"
+  fi
+
+  # 校验：条目数不变 + 旧值不再出现
+  c2=$(grep -c '<setting ' "$wf" 2>/dev/null)
+  bad=0
+  for ov in $oldvals; do
+    grep -qF "value=\"$ov\"" "$wf" 2>/dev/null && bad=1
+  done
+  if [ "$c1" != "$c2" ] || [ $bad -ne 0 ]; then
+    log "ssaid: replace failed user=$u pkg=$pkg (settings $c1/$c2 stale=$bad)"
+    [ $abx -eq 1 ] && rm -f "$wf"
+    return 1
+  fi
+
+  if [ $abx -eq 1 ]; then
+    if /system/bin/xml2abx "$wf" "$f.abx" 2>>"$LOG" \
+       && /system/bin/abx2xml "$f.abx" "$wf.chk" 2>>"$LOG" \
+       && [ "$(grep -c '<setting ' "$wf.chk" 2>/dev/null)" = "$c1" ]; then
+      okc=1
+      for ov in $oldvals; do
+        grep -qF "value=\"$ov\"" "$wf.chk" 2>/dev/null && okc=0
+      done
+      if [ $okc -eq 1 ]; then
+        mv -f "$f.abx" "$f"
+      else
+        log "ssaid: verify failed user=$u"
+        cp -f "$BACKUP/ssaid.$u.xml" "$f"; fix_meta "$f"
+        rm -f "$wf" "$wf.chk" "$f.abx"; return 1
+      fi
+    else
+      log "ssaid: convert/verify failed user=$u"
+      cp -f "$BACKUP/ssaid.$u.xml" "$f"; fix_meta "$f"
+      rm -f "$wf" "$wf.chk" "$f.abx"; return 1
+    fi
+    rm -f "$wf" "$wf.chk"
+  else
+    if [ ! -s "$f" ]; then
+      log "ssaid: empty after write user=$u"
+      cp -f "$BACKUP/ssaid.$u.xml" "$f"; fix_meta "$f"; return 1
+    fi
+  fi
+  fix_meta "$f"
+  # 记录当前/目标样本值（面板读这个，而不是 legacy 值）
+  v=$(ssaid_read "$f" 2>/dev/null)
+  [ -n "$v" ] && { echo "$v" > "$STATE/ssaid.current"; echo "$v" > "$STATE/ssaid.target"; }
+  log "ssaid edited user=$u pkg=$pkg"
+}
+
+# 全局（legacy）Android ID：settings get secure android_id 读的就是它
+ssaid_legacy_rotate() {
+  f=/data/system/users/0/settings_secure.xml
+  [ -f "$f" ] || { log "legacy: no $f"; return 1; }
+  backup_once "$f" "secure.0.xml"
+  abx=0
+  [ "$(head -c 3 "$f" 2>/dev/null)" = "ABX" ] && abx=1
+  if [ $abx -eq 1 ]; then
+    /system/bin/abx2xml "$f" "$f.xml" 2>>"$LOG" || { log "legacy: abx2xml failed"; return 1; }
+    wf="$f.xml"
+  else
+    wf="$f"
+  fi
+  c1=$(grep -c '<setting ' "$wf" 2>/dev/null)
+  nv=$(gen_aid)
+  awk -v new="$nv" '
+    /<setting / && index($0, "name=\"android_id\"") > 0 {
+      sub(/value="[^"]*"/, "value=\"" new "\"");
+      sub(/defaultValue="[^"]*"/, "defaultValue=\"" new "\"");
+    }
+    { print }' "$wf" > "$wf.tmp" && mv -f "$wf.tmp" "$wf"
+  c2=$(grep -c '<setting ' "$wf" 2>/dev/null)
+  if [ "$c1" != "$c2" ] || ! grep -qF "$nv" "$wf" 2>/dev/null; then
+    log "legacy: replace failed ($c1/$c2)"
+    [ $abx -eq 1 ] && rm -f "$wf"
+    return 1
+  fi
+  if [ $abx -eq 1 ]; then
+    if /system/bin/xml2abx "$wf" "$f.abx" 2>>"$LOG" \
+       && /system/bin/abx2xml "$f.abx" "$wf.chk" 2>>"$LOG" \
+       && [ "$(grep -c '<setting ' "$wf.chk" 2>/dev/null)" = "$c1" ] \
+       && grep -qF "$nv" "$wf.chk" 2>/dev/null; then
+      mv -f "$f.abx" "$f"
+    else
+      log "legacy: convert/verify failed"
+      cp -f "$BACKUP/secure.0.xml" "$f" 2>/dev/null; fix_meta "$f"
+      rm -f "$wf" "$wf.chk" "$f.abx"; return 1
+    fi
+    rm -f "$wf" "$wf.chk"
+  fi
+  fix_meta "$f"
+  echo "$nv" > "$STATE/ssaid.target" 2>/dev/null
+  log "legacy android_id rotated: $nv"
+}
+
+appset_reset() {
+  f=/data/system/app_set_ids.xml
+  [ -f "$f" ] || { log "appset: no $f"; return 1; }
+  backup_once "$f" "app_set_ids.xml"
+  abx=0
+  [ "$(head -c 3 "$f" 2>/dev/null)" = "ABX" ] && abx=1
+  if [ $abx -eq 1 ]; then
+    /system/bin/abx2xml "$f" "$f.xml" 2>>"$LOG" || return 1
+    wf="$f.xml"
+  else
+    wf="$f"
+  fi
+  new=$(gen_aid)
+  awk -v new="$new" '{ if ($0 ~ /app-set-id/) gsub(/id="[^"]*"/, "id=\"" new "\""); print }' "$wf" > "$wf.tmp"
+  [ -s "$wf.tmp" ] || { rm -f "$wf.tmp"; return 1; }
+  mv -f "$wf.tmp" "$wf"
+  if [ $abx -eq 1 ]; then
+    /system/bin/xml2abx "$wf" "$f.abx" 2>>"$LOG" && mv -f "$f.abx" "$f"
+    rm -f "$wf"
+  fi
+  fix_meta "$f"
+  log "appset reset"
+}
+
+oaid_rotate() {
+  backup_once /data/system/oaid_persistence_0 oaid_persistence_0
+  backup_once /data/system/openid_config.xml openid_config.xml
+  [ -f "$OAID_JAR" ] || { log "oaid: jar missing"; return 1; }
+  # 注意：该 jar 会把 "OAID_RUNTIME=ready" / "OUID=..." 打到 stdout，
+  # 必须与 stdout 一起重定向，否则会污染 CGI 的 JSON 响应
+  out=$(CLASSPATH="$OAID_JAR" /system/bin/app_process -Djava.class.path="$OAID_JAR" \
+    /system/bin OplusOaidRuntime rotate 2>&1)
+  [ -n "$out" ] && printf '%s\n' "$out" >> "$LOG"
+  # rotate 会把新 OUID 打到 stdout，这就是后续查询会拿到的新广告标识
+  ov=$(printf '%s\n' "$out" | sed -n 's/^OUID=//p' | head -1)
+  if [ -n "$ov" ]; then
+    printf '%s\n' "$ov" > "$STATE/oaid.current"
+    log "oaid rotated -> $ov"
+  fi
+  log "oaid rotate"
+}
+
+# ---------- DRM ----------
+drm_push() {
+  [ -e "$DRM_PROC" ] || { log "drm: node absent"; return 1; }
+  id=$(jget drmid < "$STATE/identity.json" 2>/dev/null)
+  [ -n "$id" ] || id=$(conf_get DRM)
+  uids=$(conf_get DRM_UIDS); hamt=$(conf_get DRM_HALUID)
+  [ -n "$hamt" ] || hamt=1013
+  # 目标应用按包名存，下发前解析成 uid
+  ru=$(resolve_uids)
+  [ -n "$ru" ] && { uids="$ru"; conf_set DRM_UIDS "$ru"; }
+  [ -n "$id" ] && echo "id $id" > "$DRM_PROC" 2>/dev/null
+  echo "uids ${uids:-0}" > "$DRM_PROC" 2>/dev/null
+  echo "haluid $hamt" > "$DRM_PROC" 2>/dev/null
+  if [ "$(conf_get DRM_APPLY)" = "1" ]; then echo "apply 1" > "$DRM_PROC"; else echo "apply 0" > "$DRM_PROC"; fi
+  echo "enable 1" > "$DRM_PROC" 2>/dev/null
+  # 回读校验：节点里的 id 必须与期望一致，否则视为下发失败
+  cur=$(sed -n 's/^id=//p' "$DRM_PROC" 2>/dev/null | head -1)
+  if [ -n "$id" ] && [ "$cur" != "$id" ]; then
+    log "drm push FAILED node_id=$cur want=$id"
+    return 1
+  fi
+  log "drm pushed id=$id uids=$uids haluid=$hamt"
+  return 0
+}
+# 重启 Widevine HAL：mediadrm 会缓存 deviceUniqueId，不重启就不会重新问 HAL，
+# 新 id 也就永远不生效（init 会自动拉起新进程）
+drm_restart_hal() {
+  p=$(pidof android.hardware.drm-service.widevine 2>/dev/null)
+  [ -n "$p" ] && { kill "$p" 2>/dev/null; log "drm HAL restarted (pid $p)"; }
+}
+# 打开 DRM 钩子：不清 uids 为空（部分版本 sscanf 会拒），改用哨兵 uid 0 + dry-run
+drm_off() {
+  [ -e "$DRM_PROC" ] || return 0
+  echo "apply 0" > "$DRM_PROC" 2>/dev/null
+  echo "uids 0" > "$DRM_PROC" 2>/dev/null
+  log "drm hook off (apply=0 uids=0, probe kept armed)"
+}
+# 供面板/CLI 读取内核侧真实状态
+drm_stats() {
+  [ -e "$DRM_PROC" ] || { printf '{"ok":false,"error":"node absent"}\n'; return; }
+  # 节点里一行可能含多个 key=value，按空格切分再取
+  st() { awk -v k="$1" '{n=split($0,a," ");for(i=1;i<=n;i++){split(a[i],p,"=");if(p[1]==k){print p[2];exit}}}' "$DRM_PROC" 2>/dev/null; }
+  printf '{"ok":true,"mode":"%s","enabled":"%s","armed":"%s","probe":"%s","haluid":"%s","id":"%s","uids":"%s","calls":"%s","exact_hits":"%s","written":"%s","nofault_fail":"%s","w_cand":"%s","w_written":"%s"}\n' \
+    "$(st mode)" "$(st enabled)" "$(st armed)" "$(st probe)" "$(st haluid)" "$(st id)" \
+    "$(drm_uids_list)" "$(st calls)" "$(st exact_hits)" "$(st written)" "$(st nofault_fail)" "$(st w_cand)" "$(st w_written)"
+}
+
+# ---------- 状态 ----------
+st_item() {
+  o="$1"; c="$2"; t="$3"
+  if [ -z "$t" ]; then
+    # 没有目标值时：当前值与原值不同也算“已写入”（例如重启后目标已被应用并清除）
+    if [ -n "$o" ] && [ -n "$c" ] && [ "$c" != "$o" ]; then st="applied"; else st="unknown"; fi
+  elif [ "$c" = "$t" ]; then st="applied"
+  else st="pending"; fi
+  printf '{"original":"%s","current":"%s","target":"%s","state":"%s"}' \
+    "$(esc "$o")" "$(esc "$c")" "$(esc "$t")" "$st"
+}
+
+# 面板专用的 status 缓存：2 秒内重复请求直接回放，写操作会主动失效
+# （仅缓存 status 输出，不影响任何写路径的正确性）
+do_status_cached() {
+  _c="$STATE/status.cache"
+  if [ -f "$_c" ]; then
+    _age=$(( $(date +%s) - $(stat -c %Y "$_c" 2>/dev/null || echo 0) ))
+    if [ "$_age" -lt 5 ] 2>/dev/null; then cat "$_c"; return; fi
+  fi
+  do_status > "$_c" 2>/dev/null
+  cat "$_c"
+}
+
+do_status() {
+  t_ser=$(jget serial < "$STATE/identity.json" 2>/dev/null)
+  t_drm=$(jget drmid < "$STATE/identity.json" 2>/dev/null)
+  c_ser=$(cur_serial); c_aid=$(cur_aid); c_oaid=$(cur_oaid); c_soc=$(cur_soc)
+  # Android ID 的“原值”取自安装时备份的 ssaid 文件样本（legacy 值不代表应用实际看到的）
+  b_aid=$(head -1 "$STATE/ssaid.orig" 2>/dev/null)
+  if [ -z "$b_aid" ]; then
+    b_aid=$(ssaid_read "$BACKUP/ssaid.0.xml" 2>/dev/null)
+    [ -n "$b_aid" ] && echo "$b_aid" > "$STATE/ssaid.orig"
+  fi
+  [ -n "$b_aid" ] || b_aid=$(baseline_get android_id)
+  # OAID 在 OPLUS 上无持久化文件，早期 baseline 常抓到空值：一旦读到现在值就回填
+  b_oaid=$(baseline_get oaid)
+  oa_src=$(sed -n 's/.*"oaid_src":"\([^"]*\)".*/\1/p' "$STATE/baseline.json" 2>/dev/null | head -1)
+  if [ -z "$b_oaid" ] && [ -n "$c_oaid" ]; then
+    b_oaid="$c_oaid"; oa_src=cache
+    sed -i "s|\"oaid\":\"[^\"]*\"|\"oaid\":\"$c_oaid\",\"oaid_src\":\"cache\"|" "$STATE/baseline.json" 2>/dev/null
+    log "baseline oaid filled from cache: $c_oaid"
+  fi
+  # 回填值来自应用缓存，并不是真正的出厂原值，面板上要区分开
+  b_oaid_show="$b_oaid"
+  [ "$oa_src" = "cache" ] && b_oaid_show=""
+  # Android ID 的目标值（未重启前显示为「待应用」）
+  t_aid=$(head -1 "$STATE/ssaid.target" 2>/dev/null)
+  [ -f "$STATE/pending_reboot" ] || t_aid=""
+  drm_id=$(drm_get id); drm_mode=$(drm_get mode); drm_en=$(drm_get enabled)
+  drm_arm=$(drm_get armed); drm_hal=$(drm_get haluid); drm_uids=$(drm_uids_list)
+
+  printf '{"ok":true,'
+  mst=$(conf_get MASTER)
+  [ -n "$mst" ] || mst=$([ "$(conf_get DRM_APPLY)" = "1" ] && echo 1 || echo 0)
+  printf '"config":{"schema":3,"master_enabled":%s,"drm_apply":"%s","stop_after":"%s","clear_qimei":"%s","drm_stop":"%s"},' \
+    "$([ "$mst" = "1" ] && echo true || echo false)" "$(conf_get DRM_APPLY)" "$(conf_get STOP_AFTER)" "$(conf_get CLEAR_QIMEI)" "$(conf_get DRM_STOP)"
+  printf '"device":{"brand":"%s","model":"%s","serial":"%s","fingerprint":"%s"},' \
+    "$(esc "$(getprop ro.product.brand)")" "$(esc "$(getprop ro.product.model)")" \
+    "$(esc "$c_ser")" "$(esc "$(getprop ro.build.fingerprint)")"
+  printf '"identities":{'
+  printf '"serial":%s,' "$(st_item "$(baseline_get serial)" "$c_ser" "$t_ser")"
+  printf '"soc_serial":%s,' "$(st_item "$(baseline_get soc_serial)" "$c_soc" "")"
+  printf '"androidid":%s,' "$(st_item "$b_aid" "$c_aid" "$t_aid")"
+  printf '"oaid":%s,' "$(st_item "$b_oaid_show" "$c_oaid" "$(head -1 "$STATE/oaid.current" 2>/dev/null)")"
+  printf '"drmid":%s' "$(st_item "$(baseline_get drmid)" "$drm_id" "$t_drm")"
+  printf '},'
+  printf '"drm":{"node":%s,"mode":"%s","enabled":"%s","armed":"%s","haluid":"%s","pkgs":"%s","virtual_id":"%s"},' \
+    "$([ -e "$DRM_PROC" ] && echo true || echo false)" \
+    "$(esc "$drm_mode")" "$(esc "$drm_en")" "$(esc "$drm_arm")" "$(esc "$drm_hal")" \
+    "$(esc "$(conf_get DRM_PKGS)")" "$(esc "$drm_id")"
+  printf '"surfaces":['
+  printf '{"id":"serial","state":"%s","detail":"resetprop"},' "$([ -n "$RESETPROP" ] && echo ready || echo missing)"
+  printf '{"id":"ssaid","state":"%s","detail":"abx+xml"},' "$([ -x /system/bin/xml2abx ] && echo ready || echo unsupported)"
+  printf '{"id":"appset","state":"%s","detail":"xml"},' "$([ -f /data/system/app_set_ids.xml ] && echo ready || echo absent)"
+  oaid_det=oplus-cache; [ -s "$STATE/oaid.current" ] && oaid_det=oplus-rotate
+  printf '{"id":"oaid","state":"%s","detail":"%s"},' "$(oaid_state "$c_oaid")" "$oaid_det"
+  printf '{"id":"drm","state":"%s","detail":"kernel-binder"}' "$([ -e "$DRM_PROC" ] && echo ready || echo missing)"
+  printf '],'
+  nb=$(ls "$BACKUP" 2>/dev/null | wc -l | tr -d ' ')
+  printf '"backups":%s,' "${nb:-0}"
+  # 可还原能力矩阵：只看备份/载体是否真实存在，不猜
+  r_ser=false; [ -n "$(baseline_get serial)" ] && r_ser=true
+  r_ssaid=false; ls "$BACKUP"/ssaid.*.xml >/dev/null 2>&1 && r_ssaid=true
+  r_oaid=false; { [ -f /data/system/oaid_persistence_0 ] || [ -f "$BACKUP/oaid_persistence_0" ]; } && r_oaid=true
+  r_appset=false; { [ -f /data/system/app_set_ids.xml ] || [ -f "$BACKUP/app_set_ids.xml" ]; } && r_appset=true
+  r_drm=false; [ -e "$DRM_PROC" ] && r_drm=true
+  printf '"restorable":{"serial":%s,"ssaid":%s,"oaid":%s,"appset":%s,"drm":%s},' \
+    "$r_ser" "$r_ssaid" "$r_oaid" "$r_appset" "$r_drm"
+  printf '"global_reset":{"state":"%s","reboot_required":%s},' \
+    "$([ -f "$STATE/pending_reboot" ] && echo prepared || echo idle)" \
+    "$([ -f "$STATE/pending_reboot" ] && echo true || echo false)"
+  printf '"last_action":{"sequence":%s}}\n' "$(cat "$STATE/action_seq" 2>/dev/null || echo 0)"
+}
+
+# ---------- 动作 ----------
+bump() { n=$(( $(cat "$STATE/action_seq" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/action_seq"; echo "$n"; }
+
+do_apply() {
+  # 手动「应用配置」即视为重新启用总开关
+  [ "$(conf_get MASTER)" = "1" ] || conf_set MASTER 1
+  rm -f "$STATE/pending_reboot"
+  baseline_once
+  ser=$(conf_get SERIAL); aid=$(conf_get ANDROID_ID); oai=$(conf_get OAID); drm=$(conf_get DRM)
+  old_ser=$(jget serial < "$STATE/identity.json" 2>/dev/null)
+  old_drm=$(jget drmid < "$STATE/identity.json" 2>/dev/null)
+
+  case "$ser" in random) NS=$(gen_serial);; keep) NS="$old_ser";; "") NS="";; *) NS="$ser";; esac
+  case "$drm" in random) ND=$(gen_drmid);; keep) ND="$old_drm";; "") ND="";; *) ND="$drm";; esac
+  printf '{"serial":"%s","drmid":"%s"}\n' "$NS" "$ND" > "$STATE/identity.json"
+
+  [ -n "$NS" ] && serial_apply "$NS"
+  [ -n "$ND" ] && drm_push
+  if [ "$aid" = "random" ]; then
+    for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do ssaid_edit "$u" "*" ""; done
+    echo 1 > "$STATE/pending_reboot"
+  fi
+  [ "$oai" = "rotate" ] && oaid_rotate
+  bump >/dev/null
+  do_status
+}
+
+do_randomize() {
+  baseline_once
+  NS=$(gen_serial); ND=$(gen_drmid)
+  printf '{"serial":"%s","drmid":"%s"}\n' "$NS" "$ND" > "$STATE/identity.json"
+  conf_set SERIAL "$NS"; conf_set DRM "$ND"
+  conf_set MASTER 1
+  serial_apply "$NS"
+  drm_push
+  for u in $(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$'); do ssaid_edit "$u" "*" ""; done
+  ssaid_legacy_rotate
+  oaid_rotate
+  appset_reset
+  echo 1 > "$STATE/pending_reboot"
+  stop_targets
+  clear_qimei
+  bump >/dev/null
+  do_status
+}
+
+do_ssaid() {
+  users="$2"
+  if [ -z "$users" ] || [ "$users" = "all" ]; then
+    users=$(ls /data/system/users 2>/dev/null | grep -E '^[0-9]+$')
+  fi
+  ok=0; fail=0
+  for u in $users; do
+    if ssaid_edit "$u" "${1:-*}" ""; then ok=$((ok+1)); else fail=$((fail+1)); fi
+  done
+  [ $ok -gt 0 ] && echo 1 > "$STATE/pending_reboot"
+  printf '{"ok":true,"ok_users":%d,"failed_users":%d,"reboot_required":%s}\n' \
+    "$ok" "$fail" "$([ $ok -gt 0 ] && echo true || echo false)"
+}
+
+# 一键更换后：停掉目标应用 / 清 QIMEI 缓存
+pkg_of_uid() { cmd package list packages --uid "$1" 2>/dev/null | sed -n 's/^package:\([^ ]*\).*/\1/p' | head -1; }
+uid_of_pkg() { stat -c %u "/data/data/$1" 2>/dev/null || cmd package list packages -U 2>/dev/null | sed -n "s/^package:$1 uid:\([0-9]*\)$/\1/p" | head -1; }
+# 目标应用统一按包名保存，下发时转 uid（换设备也能用）
+resolve_uids() {
+  out=""
+  for p in $(conf_get DRM_PKGS | tr ',' ' '); do
+    v=$(uid_of_pkg "$p"); [ -n "$v" ] && out="$out$v,"
+  done
+  printf '%s' "${out%,}"
+}
+stop_pkgs() { for p in $(conf_get DRM_PKGS | tr ',' ' '); do [ -n "$p" ] && am force-stop "$p" 2>/dev/null; done; }
+stop_targets() {
+  [ "$(conf_get STOP_AFTER)" = "1" ] || return 0
+  stop_pkgs
+  log "force-stop targets done"
+}
+clear_qimei() {
+  [ "$(conf_get CLEAR_QIMEI)" = "1" ] || return 0
+  for p in $(conf_get DRM_PKGS | tr ',' ' '); do
+    [ -n "$p" ] || continue
+    find "/data/data/$p" -maxdepth 3 -iname '*qimei*' -exec rm -f {} \; 2>/dev/null
+    log "qimei cache cleared: $p"
+  done
+}
+
+do_restore() {
+  o=$(jget serial < "$STATE/original.json" 2>/dev/null)
+  [ -n "$o" ] && serial_apply "$o"
+  drm_off
+  n=0
+  for b in "$BACKUP"/ssaid.*.xml; do
+    [ -f "$b" ] || continue
+    u=$(echo "$b" | sed -n 's/.*ssaid\.\([0-9]*\)\.xml$/\1/p')
+    [ -n "$u" ] || continue
+    cp -f "$b" "/data/system/users/$u/settings_ssaid.xml" && fix_meta "/data/system/users/$u/settings_ssaid.xml"
+    n=$((n+1))
+  done
+  [ -f "$BACKUP/secure.0.xml" ] && cp -f "$BACKUP/secure.0.xml" /data/system/users/0/settings_secure.xml && fix_meta /data/system/users/0/settings_secure.xml
+  [ -f "$BACKUP/app_set_ids.xml" ] && cp -f "$BACKUP/app_set_ids.xml" /data/system/app_set_ids.xml && fix_meta /data/system/app_set_ids.xml
+  [ -f "$BACKUP/oaid_persistence_0" ] && cp -f "$BACKUP/oaid_persistence_0" /data/system/oaid_persistence_0 && fix_meta /data/system/oaid_persistence_0
+  rm -f "$STATE/identity.json"
+  # 只复位总开关状态；config 里的目标值保留，方便「重新开启」时按原配置再次应用
+  conf_set MASTER 0
+  sk=""
+  { [ -f /data/system/oaid_persistence_0 ] || [ -f "$BACKUP/oaid_persistence_0" ]; } || sk="$sk\"oaid\","
+  { [ -f /data/system/app_set_ids.xml ] || [ -f "$BACKUP/app_set_ids.xml" ]; } || sk="$sk\"appset\","
+  sk=$(printf '%s' "$sk" | sed 's/,$//')
+  [ $n -gt 0 ] && echo 1 > "$STATE/pending_reboot"
+  printf '{"ok":true,"restored":{"ssaid_users":%d},"skipped":[%s],"reboot_required":%s}\n' "$n" "$sk" "$([ $n -gt 0 ] && echo true || echo false)"
+}
+
+do_drm_info() {
+  if [ -e "$DRM_PROC" ]; then
+    printf '{"ok":true,"raw":"%s"}\n' "$(esc "$(cat "$DRM_PROC" 2>/dev/null)")"
+  else
+    printf '{"ok":false,"error":"node absent"}\n'
+  fi
+}
+
+[ "$1" != "status" ] && rm -f "$STATE/status.cache" 2>/dev/null
+case "$1" in
+  status)      do_status_cached ;;
+  apply)       do_apply ;;
+  randomize)   do_randomize ;;
+  serial)      baseline_once
+               if [ "$2" = "random" ]; then V=$(gen_serial); else V="$2"; fi
+               [ -n "$V" ] || { echo '{"ok":false,"error":"empty"}'; exit 1; }
+               serial_apply "$V"
+               # 同步 identity/config，否则重启时 post-fs-data 会把旧值写回去
+               conf_set SERIAL "$V"
+               printf '{"serial":"%s","drmid":"%s"}\n' "$V" \
+                 "$(jget drmid < "$STATE/identity.json" 2>/dev/null)" > "$STATE/identity.json"
+               do_status ;;
+  ssaid)       do_ssaid "$2" "${3:-all}" ;;
+  appset)      appset_reset; echo '{"ok":true}' ;;
+  oaid)        oaid_rotate; echo '{"ok":true}' ;;
+  drm)         drm_push; echo '{"ok":true}' ;;
+  drm-off)     drm_off; echo '{"ok":true}' ;;
+  drm-stats)   drm_stats ;;
+  opt-stop)    conf_set STOP_AFTER "$2"; echo '{"ok":true}' ;;
+  opt-qimei)   conf_set CLEAR_QIMEI "$2"; echo '{"ok":true}' ;;
+  opt-drmstop) conf_set DRM_STOP "$2"; echo '{"ok":true}' ;;
+  drmpkgs)     conf_set DRM_PKGS "$2"; ru=$(resolve_uids)
+               conf_set DRM_UIDS "$ru"
+               echo "uids ${ru:-0}" > "$DRM_PROC" 2>/dev/null
+               log "drm pkgs set: $2 -> uids ${ru:-0}"
+               printf '{"ok":true,"uids":"%s"}\n' "$ru" ;;
+  serial-restore)
+               o=$(baseline_get serial); [ -n "$o" ] || o=$(jget serial < "$STATE/original.json" 2>/dev/null)
+               [ -n "$o" ] && serial_apply "$o"; do_status ;;
+  drmid-rand)  ND=$(gen_drmid); cs=$(jget serial < "$STATE/identity.json" 2>/dev/null)
+               printf '{"serial":"%s","drmid":"%s"}\n' "$cs" "$ND" > "$STATE/identity.json"
+               conf_set DRM "$ND"
+               drm_push >/dev/null 2>&1
+               drm_restart_hal; [ "$(conf_get DRM_STOP)" = "1" ] && stop_pkgs
+               log "drmid randomized: $ND"
+               printf '{"ok":true,"id":"%s"}\n' "$ND" ;;
+  drmid)       printf '{"serial":"","drmid":"%s"}\n' "$2" > "$STATE/identity.json"
+               conf_set DRM "$2"
+               drm_push >/dev/null 2>&1
+               drm_restart_hal; [ "$(conf_get DRM_STOP)" = "1" ] && stop_pkgs
+               echo '{"ok":true}' ;;
+  uids)        echo "uids $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_UIDS "$2"; echo '{"ok":true}' ;;
+  haluid)      echo "haluid $2" > "$DRM_PROC" 2>/dev/null; conf_set DRM_HALUID "$2"; echo '{"ok":true}' ;;
+  restore)     do_restore ;;
+  setmaster)   if [ "$2" = "1" ]; then do_apply; else do_restore; fi ;;
+  baseline)    cat "$STATE/baseline.json" 2>/dev/null || echo '{}' ;;
+  conf)        if [ -n "$3" ]; then conf_set "$2" "$3"; echo '{"ok":true}'; else conf_get "$2"; fi ;;
+  log)         printf '{"ok":true,"log":"%s"}\n' "$(esc "$(tail -n 200 "$LOG" 2>/dev/null)")" ;;
+  *)           echo '{"ok":false,"error":"unknown action"}'; exit 2 ;;
+esac
