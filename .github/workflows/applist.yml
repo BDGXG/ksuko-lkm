@@ -1,0 +1,37 @@
+name: applist
+
+# 只负责把 tools/applist/AppList.java 编成 applist.jar（跑在 app_process 里，用系统 PackageManager 取图标）
+on:
+  push:
+    branches: [drm-m15]
+    paths:
+      - "tools/applist/**"
+      - ".github/workflows/applist.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          AJ=$(ls -d "$SDK"/platforms/android-*/android.jar | sort -V | tail -1)
+          D8=$(ls -d "$SDK"/build-tools/*/d8 | sort -V | tail -1)
+          echo "android.jar=$AJ"
+          mkdir -p out/classes out/dex
+          javac -source 8 -target 8 -bootclasspath "$AJ" -d out/classes tools/applist/AppList.java
+          "$D8" --min-api 29 --output out/dex $(find out/classes -name '*.class')
+          cd out/dex && zip -q -r ../../applist.jar classes.dex
+          cd ../.. && ls -l applist.jar && unzip -l applist.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: applist.jar
+          path: applist.jar
+          if-no-files-found: error
