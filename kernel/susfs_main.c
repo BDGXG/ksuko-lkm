@@ -295,6 +295,7 @@ static void susfs_layers_down(int upto)
 }
 
 #include "drm_guard.h"
+#include "taint_spoof.h"
 
 static int __init susfs_init(void)
 {
@@ -352,6 +353,10 @@ static int __init susfs_init(void)
 
     /* Registered last and undone implicitly: these are entries in sus_path's table, which
      * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
+    /* taint_spoof：hook get_taint()，让 /proc/sys/kernel/tainted 读回 0 */
+    if (susfs_taint_spoof_init())
+        pr_warn("susfs_guard_lkm: taint_spoof init failed - taint stays visible\n");
+
     /* drm_guard：Widevine deviceUniqueId 改写（binder 层） */
     if (drm_guard_init())
         pr_warn("susfs_guard_lkm: drm_guard init failed - DRM spoof stays off\n");
@@ -376,6 +381,7 @@ static int __init susfs_init(void)
 
 static void __exit susfs_exit(void)
 {
+    susfs_taint_spoof_exit();
     drm_guard_exit();
     susfs_layers_down((int)ARRAY_SIZE(susfs_layers) - 1);
     SUSFS_LOGI("susfs_guard_lkm: exit\n");
