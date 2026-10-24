@@ -44,6 +44,7 @@
 #include <linux/workqueue.h>	/* the pending-resolution retry timer */
 #include <linux/mutex.h>	/* serialises the first rule's arming */
 #include <linux/limits.h>
+#include <linux/timekeeping.h>	/* ktime_get_real_seconds() for the hit log */
 #include <linux/cred.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>
@@ -431,12 +432,61 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
+/* Per-app filter (hideguard/device_hide integration): when this string is non-empty, a
+ * process is only treated as a hiding candidate when its uid appears in this comma/space
+ * separated list.  Empty (default) keeps the upstream behaviour: every KernelSU-umounted
+ * app is hidden.  It is a live parameter, so it can be changed without reloading:
+ *   echo 10336 > /sys/module/susfs_guard_lkm/parameters/target_uids
+ * This reproduces the "only these apps must see the path as absent" rule that the vendor
+ * (device_hide) module expressed through its own target_uids insmod parameter. */
+static char target_uids_buf[512] = "";
+module_param_string(target_uids, target_uids_buf, sizeof(target_uids_buf), 0644);
+
+/* True when the calling process' uid is allowed to be hidden.  An empty list means
+ * "no restriction" (return true), which makes this a pure opt-in narrowing. */
+static bool sus_target_uid_match(void)
+{
+    const char *p = target_uids_buf;
+    uid_t cur = current_uid().val;
+    bool any_digit = false;
+
+    if (!p)
+        return true;
+    /* sysfs 写入总是带着尾部换行，而 param_set_copystring() 并不会去掉它：MODE=global 时
+     * 用户态写进去的是 "\n"，旧逻辑把它当成「非空、但一个 uid 都没有的列表」，于是每一次
+     * 比较都不匹配 -> 全局拦截完全失效（表现为命中计数一动不动）。
+     * 这里做两件事：跳过前导空白；把「整串没有任何数字」视为未限制（等价于空列表）。 */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (!*p)
+        return true;
+    while (*p) {
+        unsigned long v = 0;
+        bool any = false;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (unsigned long)(*p - '0');
+            any = true;
+            any_digit = true;
+            p++;
+        }
+        if (any && (uid_t)v == cur)
+            return true;
+        while (*p && (*p < '0' || *p > '9'))
+            p++;
+    }
+    if (!any_digit)
+        return true;
+    return false;
+}
+
 /* UID half of the upstream gate: a PENDING rule has no inode to ask about ownership
  * (sus_path_entry_gate_any()). */
 static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
+    if (!sus_target_uid_match())
+        return false;
     return susfs_is_current_proc_umounted_app();
 }
 
@@ -448,6 +498,8 @@ static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
+    if (!sus_target_uid_match())
+        return false;
     if (!susfs_is_current_proc_umounted_app())
         return false;
     return current_uid().val != inode->i_uid.val;
@@ -1098,6 +1150,170 @@ static struct ksu_lsm_hook sus_path_getattr_hook =
 static struct ksu_lsm_hook sus_path_perm_hook =
 	KSU_LSM_HOOK_INSERT(inode_permission, (void *)sus_path_inode_permission);
 
+/* ---- per-uid / per-path hit accounting (hideguard module UI) ----
+ * The upstream sus_path layer only keeps global enoent counters.  The hideguard
+ * control UI needs to show WHICH app was blocked on WHICH registered path and how
+ * many times, so a small table is kept here: one slot per (uid, path) pair, plus
+ * one global total.  A slot is never overwritten once used; when the table is
+ * full further pairs only bump the global total (the detail view is a diagnostic,
+ * not an audit log).  Slots start empty and survive until unload.
+ */
+#define SUS_HIT_SLOTS 64
+struct sus_hit_slot {
+    bool used;
+    u32 uid;
+    u64 cnt;
+    u64 last_ts;
+    char path[SUS_PATH_LEN];
+};
+static struct sus_hit_slot sus_hit_tab[SUS_HIT_SLOTS];
+static DEFINE_SPINLOCK(sus_hit_lock);
+static atomic64_t sus_hit_total = ATOMIC64_INIT(0);
+
+/* Ring of the most recent hits, so the UI can list WHEN a rule fired.
+ * 256 entries * 16 bytes; the oldest entry is overwritten first.  The slot
+ * index points into sus_hit_tab (slots are never recycled), which keeps the
+ * per-event record small and lets the reader recover uid+path from the table. */
+#define SUS_HIT_EVENTS 256
+struct sus_hit_evt {
+    u64 ts;
+    u32 slot;
+};
+static struct sus_hit_evt sus_hit_evt[SUS_HIT_EVENTS];
+static u32 sus_hit_evt_pos;
+
+static void sus_hit_record(const char *path)
+{
+    unsigned long flags;
+    u32 uid = (u32)current_uid().val;
+    u64 now = ktime_get_real_seconds();
+    int i, slot = -1;
+
+    if (!path || !path[0])
+        return;
+    spin_lock_irqsave(&sus_hit_lock, flags);
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        if (sus_hit_tab[i].used && sus_hit_tab[i].uid == uid &&
+            !strcmp(sus_hit_tab[i].path, path)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (i = 0; i < SUS_HIT_SLOTS; i++) {
+            if (!sus_hit_tab[i].used) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot >= 0) {
+        if (!sus_hit_tab[slot].used) {
+            sus_hit_tab[slot].used = true;
+            sus_hit_tab[slot].uid = uid;
+            sus_hit_tab[slot].cnt = 0;
+            strscpy(sus_hit_tab[slot].path, path, SUS_PATH_LEN);
+        }
+        sus_hit_tab[slot].cnt++;
+        sus_hit_tab[slot].last_ts = now;
+        {
+            unsigned int ep = sus_hit_evt_pos % SUS_HIT_EVENTS;
+            sus_hit_evt[ep].ts = now;
+            sus_hit_evt[ep].slot = (u32)slot;
+            sus_hit_evt_pos++;
+        }
+    }
+    atomic64_inc(&sus_hit_total);
+    spin_unlock_irqrestore(&sus_hit_lock, flags);
+}
+
+/* /proc/susfs_hitlog: TOTAL <n> followed by one HIT line per (uid, path) pair.
+ * TAB separated, matching the hideguard webui parser:
+ *   TOTAL<TAB><total>
+ *   HIT<TAB><uid><TAB><count><TAB><last_ts><TAB><path>
+ * 0600: root only, so it is not part of the hidden control surface.
+ */
+static int sus_hitlog_show(struct seq_file *m, void *v)
+{
+    unsigned long flags;
+    int i;
+
+    seq_printf(m, "TOTAL\t%llu\n", (unsigned long long)atomic64_read(&sus_hit_total));
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        char pbuf[SUS_PATH_LEN];
+        u32 uid;
+        u64 cnt, ts;
+        bool used;
+
+        spin_lock_irqsave(&sus_hit_lock, flags);
+        used = sus_hit_tab[i].used;
+        uid = sus_hit_tab[i].uid;
+        cnt = sus_hit_tab[i].cnt;
+        ts = sus_hit_tab[i].last_ts;
+        if (used)
+            memcpy(pbuf, sus_hit_tab[i].path, SUS_PATH_LEN);
+        spin_unlock_irqrestore(&sus_hit_lock, flags);
+        pbuf[SUS_PATH_LEN - 1] = 0;
+        if (used)
+            seq_printf(m, "HIT\t%u\t%llu\t%llu\t%s\n", uid,
+                       (unsigned long long)cnt, (unsigned long long)ts, pbuf);
+    }
+    {
+        unsigned int n = sus_hit_evt_pos < SUS_HIT_EVENTS ? sus_hit_evt_pos : SUS_HIT_EVENTS;
+        unsigned int start = sus_hit_evt_pos - n;
+        unsigned int ei;
+
+        for (ei = 0; ei < n; ei++) {
+            unsigned int ep = (start + ei) % SUS_HIT_EVENTS;
+            u32 slot = READ_ONCE(sus_hit_evt[ep].slot);
+            u64 ets = READ_ONCE(sus_hit_evt[ep].ts);
+
+            if (slot < SUS_HIT_SLOTS && READ_ONCE(sus_hit_tab[slot].used))
+                seq_printf(m, "EVT\t%u\t%llu\t%s\n", sus_hit_tab[slot].uid,
+                           (unsigned long long)ets, sus_hit_tab[slot].path);
+        }
+    }
+    return 0;
+}
+
+static int sus_hitlog_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, sus_hitlog_show, NULL);
+}
+
+/* Writing anything to /proc/susfs_hitlog resets the accounting in place.
+ * The counters live in module memory, so a plain write zeroes them; this is what
+ * lets the hideguard UI clear the log instantly instead of doing rmmod+insmod
+ * (measured ~2.5s rmmod + ~0.9s insmod, with the rule table empty in between).
+ * The clear runs under sus_hit_lock so a concurrent sus_hit_record() cannot
+ * resurrect a slot mid-clear.
+ */
+static ssize_t sus_hitlog_write(struct file *file, const char __user *ubuf,
+                                size_t count, loff_t *ppos)
+{
+    unsigned long flags;
+    int i;
+    spin_lock_irqsave(&sus_hit_lock, flags);
+    for (i = 0; i < SUS_HIT_SLOTS; i++) {
+        sus_hit_tab[i].used = false;
+        sus_hit_tab[i].cnt = 0;
+        sus_hit_tab[i].last_ts = 0;
+    }
+    WRITE_ONCE(sus_hit_evt_pos, 0);
+    atomic64_set(&sus_hit_total, 0);
+    spin_unlock_irqrestore(&sus_hit_lock, flags);
+    return (ssize_t)count;
+}
+
+static const struct proc_ops sus_hitlog_proc_ops = {
+    .proc_open = sus_hitlog_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+    .proc_write = sus_hitlog_write,
+};
+static struct proc_dir_entry *sus_hitlog_node_entry;
+
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
 
@@ -1152,8 +1368,11 @@ static atomic_t n_identity_hits = ATOMIC_INIT(0);
 static bool sus_path_inode_hidden(struct inode *inode)
 {
     struct sus_path_entry *e;
-    bool hidden = false, by_identity = false;
+    bool hidden = false, by_identity = false, have_hit = false;
+    char hit_path[SUS_PATH_LEN];
     u64 dev;
+
+    hit_path[0] = 0;
 
     if (!inode || !READ_ONCE(sus_path_count))
         return false;
@@ -1197,10 +1416,17 @@ static bool sus_path_inode_hidden(struct inode *inode)
             }
         }
     }
+    if (hidden && e && !e->self_protect) {
+        strscpy(hit_path, e->path, SUS_PATH_LEN);
+        have_hit = true;
+    }
     spin_unlock(&sus_path_lock);
 
     if (by_identity)
         atomic_inc(&n_identity_hits);
+
+    if (have_hit)
+        sus_hit_record(hit_path);
 
     return hidden;
 }
@@ -2659,6 +2885,9 @@ int sus_path_init(void)
      * layer's own init, so paths resolve. */
     if (susfs_control_node_allowed()) {
         sus_path_node_entry = proc_create("susfs_path", 0777, NULL, &sus_path_proc_ops);
+        sus_hitlog_node_entry = proc_create("susfs_hitlog", 0600, NULL, &sus_hitlog_proc_ops);
+        if (!sus_hitlog_node_entry)
+            pr_warn("sus_path: proc_create(susfs_hitlog) failed\n");
         if (!sus_path_node_entry)
             pr_warn("sus_path: proc_create(susfs_path) failed - the listing stays reachable through the hide_list parameter\n");
     } else {
@@ -2701,6 +2930,10 @@ void sus_path_exit(void)
     if (sus_path_node_entry) {
         proc_remove(sus_path_node_entry);
         sus_path_node_entry = NULL;
+    }
+    if (sus_hitlog_node_entry) {
+        proc_remove(sus_hitlog_node_entry);
+        sus_hitlog_node_entry = NULL;
     }
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries (and their inode
