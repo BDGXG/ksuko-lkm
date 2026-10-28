@@ -571,7 +571,7 @@ static atomic64_t g_kb_bad;	/* dest 不在内核高半区 / 越界读数 */
 static atomic64_t g_kb_rd;	/* B 阶段已真正读过的 parcel 数 */
 #define KB_VERBOSE 2		/* 0=只计数 1=v7.1 全量扫描 2=只读前 64B 扫描 */
 #define KB_READ_BYTES 64	/* v7.3-B：最多读这么多字节，命中 4+16*2 足够 */
-#define KB_READ_CAP  2000	/* B 阶段一次 arm 最多真正读这么多 parcel */
+#define KB_READ_CAP  200000	/* v7.4：只读 <=64B 的小 reply，cap 放宽 */
 static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能 unregister，
 			 * 只把后续扫描全部短路，proc 里能看到 stop=1 */
 /* v7.1 硬上限：kretprobe 跑在 atomic 上下文，全系统 binder reply 高频，
@@ -672,8 +672,8 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 	/* v7.3-B：只读前 64 字节，且先校验地址在内核高半区 */
 	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
 	atomic64_inc(&g_kb_sz[bk]);
-	if (bytes < 4 + AID_LEN * 2)
-		return 0;
+	if (bytes < 4 + AID_LEN * 2 || bytes > KB_READ_BYTES)
+		return 0;	/* v7.4：只碰 <=64B 的小 parcel，长 parcel 一律不读 */
 	da = (u64)(unsigned long)rq->dest;
 	if (da < 0xffff000000000000ULL) {
 		atomic64_inc(&g_kb_bad);
