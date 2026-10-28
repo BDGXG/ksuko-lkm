@@ -556,9 +556,16 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 }
 
 struct kb_req {
-	void *dest;
+	void *alloc;
+	void *buffer;
+	u32 off;
 	u32 bytes;
 };
+/* v7.6：binder_alloc_copy_from_buffer 是导出符号，用来从接收方 alloc 的
+ * 内核 buffer 里回读刚由 copy_user_to_buffer 写进去的 payload。 */
+extern int binder_alloc_copy_from_buffer(void *alloc, void *dest,
+					 void *buffer, unsigned long buffer_offset,
+					 size_t bytes);
 static struct kretprobe g_kb_rp;
 static atomic64_t g_kb_calls, g_kb_scan, g_kb_hit;
 static atomic64_t g_kb_off;
@@ -569,7 +576,7 @@ static atomic64_t g_kb_sz[4];	/* <=64 / <=256 / <=1K / <=4K */
 static atomic64_t g_kb_bytesum;
 static atomic64_t g_kb_bad;	/* dest 不在内核高半区 / 越界读数 */
 static atomic64_t g_kb_rd;	/* B 阶段已真正读过的 parcel 数 */
-#define KB_VERBOSE 2		/* 0=只计数 1=v7.1 全量扫描 2=只读前 64B 扫描 */
+#define KB_VERBOSE 3		/* 0=只计数 1=v7.1 全量扫描 2=只读前 64B 扫描 */
 #define KB_READ_BYTES 512	/* v7.5：reply 整包常 >64B，窗口放宽到 512 */
 #define KB_READ_CAP  20000	/* v7.5：仅 <=512B 的 reply */
 static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能 unregister，
@@ -621,17 +628,24 @@ static int __nocfi kb_entry_handler(struct kretprobe_instance *ri,
 				    struct pt_regs *regs)
 {
 	struct kb_req *rq = (struct kb_req *)ri->data;
-	void *dest = (void *)regs->regs[1];
-	unsigned long bytes = regs->regs[3];
-	u32 cuid;
-	if (!dest || bytes < 32)
+	void *alloc = (void *)regs->regs[0];
+	void *buffer = (void *)regs->regs[1];
+	unsigned long off = regs->regs[2];
+	unsigned long bytes = regs->regs[4];
+	int pid = -1;
+	u32 ruid;
+	/* binder_alloc_copy_user_to_buffer(alloc, buffer, buffer_offset,
+	 *                                  from, bytes)：alloc 属主=接收方。
+	 * current 是发送方（reply 时是 system_server），所以 uid 白名单
+	 * 必须用 alloc->pid 反查，而不是 current_uid()。 */
+	if (!alloc || !buffer || bytes < 32)
 		return 0;
 	if (READ_ONCE(g_kb_stop))
 		return 0;
-	cuid = __kuid_val(current_uid());
-	/* 4294967295 = 不限制 uid，只在 dry-run 之外有意义；kb 探针在
-	 * atomic 上下文里跑，绝不允许全域扫描（v7 死机的直接触发条件）。 */
-	if (!cuid || cuid == (u32)-1 || !ac_uid_listed(cuid)) {
+	if (g_ac_pid_off != (size_t)-1)
+		memcpy(&pid, (char *)alloc + g_ac_pid_off, sizeof(pid));
+	ruid = ac_pid_to_uid(pid);
+	if (!ruid || !ac_uid_listed(ruid)) {
 		atomic64_inc(&g_kb_nouid);
 		return 0;
 	}
@@ -643,7 +657,9 @@ static int __nocfi kb_entry_handler(struct kretprobe_instance *ri,
 		WRITE_ONCE(g_kb_stop, true);
 		return 0;
 	}
-	rq->dest = dest;
+	rq->alloc = alloc;
+	rq->buffer = buffer;
+	rq->off = (u32)off;
 	rq->bytes = (u32)bytes;
 	return 1;
 }
@@ -653,55 +669,35 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 	struct kb_req *rq = (struct kb_req *)ri->data;
 	u32 bytes = rq->bytes, off = 0, n;
 	u8 tmp[KB_READ_BYTES];
-	u64 da;
-	int bk;
+	int bk, rc;
 	(void)regs;
-	if (!rq->dest || !bytes)
+	if (!rq->buffer || !bytes)
 		return 0;
 	if (READ_ONCE(g_kb_stop))
 		return 0;
 	atomic64_inc(&g_kb_scan);
 	atomic64_add(bytes, &g_kb_bytesum);
-#if KB_VERBOSE == 0
-	/* v7.2-A：不碰 dest 内存，只做长度分桶，判定死机来源 */
-	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
-	atomic64_inc(&g_kb_sz[bk]);
-	(void)off;
-	(void)n;
-#elif KB_VERBOSE == 2
-	/* v7.3-B：只读前 64 字节，且先校验地址在内核高半区 */
 	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
 	atomic64_inc(&g_kb_sz[bk]);
 	if (bytes < 4 + AID_LEN * 2 || bytes > KB_READ_BYTES)
-		return 0;	/* v7.4：只碰 <=64B 的小 parcel，长 parcel 一律不读 */
-	da = (u64)(unsigned long)rq->dest;
-	if (da < 0xffff000000000000ULL) {
-		atomic64_inc(&g_kb_bad);
 		return 0;
-	}
 	if (atomic64_inc_return(&g_kb_rd) > KB_READ_CAP)
 		return 0;
 	n = bytes < KB_READ_BYTES ? bytes : KB_READ_BYTES;
-	memcpy(tmp, rq->dest, n);
+	/* v7.6：数据刚刚写进接收方 alloc 的 buffer，用回读接口取出来扫 */
+	rc = binder_alloc_copy_from_buffer(rq->alloc, tmp, rq->buffer,
+					   (unsigned long)rq->off, (size_t)n);
+	if (rc) {
+		atomic64_inc(&g_kb_bad);
+		return 0;
+	}
 	if (!kb_find_aid(tmp, n, &off))
 		return 0;
 	atomic64_inc(&g_kb_hit);
-	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停：不再反复读 */
+	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停 */
 	atomic64_set(&g_kb_off, off);
 	memcpy(g_ac_dump, tmp, n);
 	WRITE_ONCE(g_ac_dump_len, n);
-#else
-	if (!kb_find_aid((const u8 *)rq->dest, bytes, &off))
-		return 0;
-	atomic64_inc(&g_kb_hit);
-	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停：不再扫，避免反复 memcpy */
-	atomic64_set(&g_kb_off, off);
-	n = bytes;
-	if (n > AC_DUMP_BYTES)
-		n = AC_DUMP_BYTES;
-	memcpy(g_ac_dump, rq->dest, n);
-	WRITE_ONCE(g_ac_dump_len, n);
-#endif
 	return 0;
 }
 static int ac_arm_locked(void)
@@ -737,7 +733,7 @@ static int ac_arm_locked(void)
 	atomic64_set(&g_kb_bytesum, 0);
 	atomic64_set(&g_kb_bad, 0);
 	atomic64_set(&g_kb_rd, 0);
-	g_kb_rp.kp.symbol_name = "binder_alloc_copy_from_buffer";
+	g_kb_rp.kp.symbol_name = "binder_alloc_copy_user_to_buffer";
 	g_kb_rp.entry_handler = kb_entry_handler;
 	g_kb_rp.handler = kb_ret_handler;
 	g_kb_rp.data_size = sizeof(struct kb_req);
