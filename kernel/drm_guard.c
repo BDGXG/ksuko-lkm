@@ -562,15 +562,31 @@ struct kb_req {
 static struct kretprobe g_kb_rp;
 static atomic64_t g_kb_calls, g_kb_scan, g_kb_hit;
 static atomic64_t g_kb_off;
-/* 在 kernel buffer 里找 [int32 len=16][16 位 hex]，UTF-16LE 与 ASCII 都试 */
+static atomic64_t g_kb_big, g_kb_nouid;
+static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能 unregister，
+			 * 只把后续扫描全部短路，proc 里能看到 stop=1 */
+/* v7.1 硬上限：kretprobe 跑在 atomic 上下文，全系统 binder reply 高频，
+ * 无上限的逐字节长扫描会把看门狗拖死（v7 死机复盘）。 */
+#define KB_MAX_BYTES  4096	/* 单个 parcel 超过这个长度一律跳过，不截断 */
+#define KB_SCAN_CAP   20000	/* 一次 arm 期间最多扫这么多 parcel */
+/* 在 kernel buffer 里找 [int32 len=16][16 位 hex]，UTF-16LE 与 ASCII 都试。
+ * 先用 memchr 找 0x10 字节做 O(1) 预过滤，避免对 4KB 逐字节跑循环。 */
 static bool __nocfi noinline kb_find_aid(const u8 *b, u32 bytes, u32 *out)
 {
-	u32 q, i;
-	for (q = 0; q + 4 + AID_LEN * 2 <= bytes; q++) {
-		u32 len;
-		memcpy(&len, b + q, 4);
-		if (len != AID_LEN)
+	u32 q = 0, i;
+	u32 last;
+	if (bytes < 4 + AID_LEN * 2)
+		return false;
+	last = bytes - 4 - AID_LEN * 2;	/* q 的合法上界 */
+	while (q <= last) {
+		const u8 *p = memchr(b + q, (int)(u8)AID_LEN, (size_t)(last - q + 1));
+		if (!p)
+			break;
+		q = (u32)(p - b);
+		if (p[1] || p[2] || p[3]) {
+			q++;
 			continue;
+		}
 		for (i = 0; i < AID_LEN; i++) {
 			u8 lo = b[q + 4 + i * 2];
 			u8 hi = b[q + 4 + i * 2 + 1];
@@ -588,6 +604,7 @@ static bool __nocfi noinline kb_find_aid(const u8 *b, u32 bytes, u32 *out)
 			*out = q;
 			return true;
 		}
+		q++;
 	}
 	return false;
 }
@@ -600,12 +617,23 @@ static int __nocfi kb_entry_handler(struct kretprobe_instance *ri,
 	u32 cuid;
 	if (!dest || bytes < 32)
 		return 0;
-	cuid = __kuid_val(current_uid());
-	if (!cuid || !ac_uid_listed(cuid))
+	if (READ_ONCE(g_kb_stop))
 		return 0;
-	if (bytes > AC_SCAN_BYTES)
-		bytes = AC_SCAN_BYTES;
-	atomic64_inc(&g_kb_calls);
+	cuid = __kuid_val(current_uid());
+	/* 4294967295 = 不限制 uid，只在 dry-run 之外有意义；kb 探针在
+	 * atomic 上下文里跑，绝不允许全域扫描（v7 死机的直接触发条件）。 */
+	if (!cuid || cuid == (u32)-1 || !ac_uid_listed(cuid)) {
+		atomic64_inc(&g_kb_nouid);
+		return 0;
+	}
+	if (bytes > KB_MAX_BYTES) {
+		atomic64_inc(&g_kb_big);
+		return 0;
+	}
+	if (atomic64_inc_return(&g_kb_calls) > KB_SCAN_CAP) {
+		WRITE_ONCE(g_kb_stop, true);
+		return 0;
+	}
 	rq->dest = dest;
 	rq->bytes = (u32)bytes;
 	return 1;
@@ -618,10 +646,13 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 	(void)regs;
 	if (!rq->dest || !bytes)
 		return 0;
+	if (READ_ONCE(g_kb_stop))
+		return 0;
 	atomic64_inc(&g_kb_scan);
 	if (!kb_find_aid((const u8 *)rq->dest, bytes, &off))
 		return 0;
 	atomic64_inc(&g_kb_hit);
+	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停：不再扫，避免反复 memcpy */
 	atomic64_set(&g_kb_off, off);
 	n = bytes;
 	if (n > AC_DUMP_BYTES)
@@ -652,6 +683,13 @@ static int ac_arm_locked(void)
 	 * (alloc, dest, buffer_off, bytes) 的 dest 是内核缓冲，返回点直接扫，
 	 * 不受 mm 属主与缺页影响；归属用 current（这时正是收 reply 的进程）。 */
 	memset(&g_kb_rp, 0, sizeof(g_kb_rp));
+	WRITE_ONCE(g_kb_stop, false);
+	atomic64_set(&g_kb_calls, 0);
+	atomic64_set(&g_kb_scan, 0);
+	atomic64_set(&g_kb_hit, 0);
+	atomic64_set(&g_kb_off, 0);
+	atomic64_set(&g_kb_big, 0);
+	atomic64_set(&g_kb_nouid, 0);
 	g_kb_rp.kp.symbol_name = "binder_alloc_copy_from_buffer";
 	g_kb_rp.entry_handler = kb_entry_handler;
 	g_kb_rp.handler = kb_ret_handler;
@@ -1203,6 +1241,10 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 	seq_printf(m, "kb calls=%lld scan=%lld hit=%lld off=%lld\n",
 		atomic64_read(&g_kb_calls), atomic64_read(&g_kb_scan),
 		atomic64_read(&g_kb_hit), atomic64_read(&g_kb_off));
+	seq_printf(m, "kb stop=%d big=%lld nouid=%lld cap=%d max=%d\n",
+		READ_ONCE(g_kb_stop) ? 1 : 0,
+		atomic64_read(&g_kb_big), atomic64_read(&g_kb_nouid),
+		KB_SCAN_CAP, KB_MAX_BYTES);
 	{
 		u32 i, n = READ_ONCE(g_ac_dump_len);
 		if (n) {
@@ -1399,6 +1441,9 @@ atomic64_set(&g_kb_calls, 0);
 atomic64_set(&g_kb_scan, 0);
 atomic64_set(&g_kb_hit, 0);
 atomic64_set(&g_kb_off, 0);
+atomic64_set(&g_kb_big, 0);
+atomic64_set(&g_kb_nouid, 0);
+WRITE_ONCE(g_kb_stop, false);
 WRITE_ONCE(g_ac_last_dstpid, -1);
 WRITE_ONCE(g_ac_last_dstuid, 0);
 WRITE_ONCE(g_ac_dump_len, 0);
