@@ -271,9 +271,15 @@ static int g_ac_last_key = -1;	/* -1 none, 0 "value", 1 "android_id" */
 static u32 g_ac_last_keyoff;	/* 首个 key 命中在 parcel 内的偏移 */
 /* key 命中处的原始字节快照（hex 打印）：值可能是 UTF-16 也可能是
  * ASCII byte[]，先把现场留证，再决定匹配规则。 */
-#define AC_DUMP_BYTES 96
+#define AC_DUMP_BYTES 512
 static u8 g_ac_dump[AC_DUMP_BYTES];
 static u32 g_ac_dump_len;
+/* 16 位 hex 命中处的现场快照（从长度字段前 4 字节开始），单独一份，
+ * 避免被 key 快照覆盖。 */
+#define AC_HDUMP_BYTES 64
+static u8 g_ac_hdump[AC_HDUMP_BYTES];
+static u32 g_ac_hdump_len;
+static u32 g_ac_hdump_off;
 static size_t g_ac_pid_off = (size_t)-1;
 static size_t g_ac_cred_uid_off = 8;
 static bool g_ac_cred_uid_ok;
@@ -308,11 +314,38 @@ static u32 __nocfi noinline ac_pid_to_uid(int pid)
 static bool ac_uid_listed(u32 uid)
 {
 	u32 i, n = READ_ONCE(g_uid_count);
-
 	for (i = 0; i < n && i < DRM_UID_LIMIT; i++)
 		if (READ_ONCE(g_uids[i]) == uid)
-			return true;
+return true;
 	return false;
+}
+/* 命中记录：调用者必须已持有 ac_lock，本函数不释放锁，也不改返回流程。
+ * k = -1 表示命中的不是 aid_keys[] 字符串，而是白名单 uid 的 parcel
+ * 里直接出现的 16 位 hex 值（Bundle String，UTF-16LE 或 ASCII）。 */
+static void ac_rec_hit(void *alloc, u32 bytes, u32 q, int k)
+{
+	int pid = -1;
+	u32 cuid = __kuid_val(current_uid());
+
+	if (alloc && g_ac_pid_off != (size_t)-1)
+		memcpy(&pid, (char *)alloc + g_ac_pid_off, sizeof(pid));
+	atomic64_inc(&g_ac_hit);
+	WRITE_ONCE(g_ac_last_pid, pid);
+	WRITE_ONCE(g_ac_last_uid, cuid);
+	WRITE_ONCE(g_ac_last_bytes, bytes);
+	WRITE_ONCE(g_ac_last_key, k);
+	WRITE_ONCE(g_ac_last_keyoff, q);
+	if (cuid && ac_uid_listed(cuid))
+		atomic64_inc(&g_ac_uid_hit);
+	{
+		u32 hl = bytes - q;
+
+		if (hl > AC_HDUMP_BYTES)
+			hl = AC_HDUMP_BYTES;
+		memcpy(g_ac_hdump, ac_buf + q, hl);
+		WRITE_ONCE(g_ac_hdump_len, hl);
+		WRITE_ONCE(g_ac_hdump_off, q);
+	}
 }
 
 static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -340,6 +373,50 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 	}
 	atomic64_inc(&g_ac_scan);
+	/* 白名单 uid 的 parcel：不看 key，直接在整块数据里找 16 位 hex 值。
+	 * Bundle 里的 String 布局是 int32 长度=16 紧跟 16 个字符，
+	 * UTF-16LE 与 ASCII 两种编码都试，命中即取证返回。 */
+	{
+		u32 cuid = __kuid_val(current_uid());
+
+		if (cuid && ac_uid_listed(cuid)) {
+			u32 q2, hitq = 0;
+			bool found = false;
+
+			for (q2 = 0; q2 + 4 + AID_LEN * 2 <= bytes; q2++) {
+				u32 len;
+
+				memcpy(&len, ac_buf + q2, 4);
+				if (len != AID_LEN)
+					continue;
+				for (i = 0; i < AID_LEN; i++) {
+					u8 lo = ac_buf[q2 + 4 + i * 2];
+					u8 hi = ac_buf[q2 + 4 + i * 2 + 1];
+
+					if (hi != 0 || !aid_is_hex(lo))
+						break;
+				}
+				if (i == AID_LEN) {
+					hitq = q2;
+					found = true;
+					break;
+				}
+				for (i = 0; i < AID_LEN; i++)
+					if (!aid_is_hex(ac_buf[q2 + 4 + i]))
+						break;
+				if (i == AID_LEN) {
+					hitq = q2;
+					found = true;
+					break;
+				}
+			}
+			if (found) {
+				ac_rec_hit(alloc, (u32)bytes, hitq, -1);
+				spin_unlock(&ac_lock);
+				return 0;
+			}
+		}
+	}
 	for (k = 0; k < ARRAY_SIZE(aid_keys); k++) {
 		klen = aid_keys[k].chars * 2;
 		for (pos = 0; pos + klen <= bytes; pos++) {
@@ -356,6 +433,15 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 			WRITE_ONCE(g_ac_last_bytes, (u32)bytes);
 			WRITE_ONCE(g_ac_last_keyoff, pos);
 			WRITE_ONCE(g_ac_last_key, (int)k);
+			/* copy_from_user 发生在发送方进程上下文，current 就是发送方；
+			 * alloc->pid 是 buffer 属主（接收方），两者语义不同。
+			 * uid 白名单判定必须用 current。 */
+			{
+				u32 cuid = __kuid_val(current_uid());
+				WRITE_ONCE(g_ac_last_uid, cuid);
+				if (cuid && ac_uid_listed(cuid))
+					atomic64_inc(&g_ac_uid_hit);
+			}
 			{
 				u32 dl = bytes - pos;
 				if (dl > AC_DUMP_BYTES)
@@ -379,21 +465,8 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 				}
 				if (i != AID_LEN)
 					continue;
-				atomic64_inc(&g_ac_hit);
-				if (g_ac_pid_off != (size_t)-1 && alloc)
-					memcpy(&pid, (char *)alloc + g_ac_pid_off,
-					       sizeof(pid));
-				WRITE_ONCE(g_ac_last_pid, pid);
-				WRITE_ONCE(g_ac_last_bytes, (u32)bytes);
-				WRITE_ONCE(g_ac_last_key, (int)k);
+				ac_rec_hit(alloc, (u32)bytes, q, (int)k);
 				spin_unlock(&ac_lock);
-				{
-					u32 uid = ac_pid_to_uid(pid);
-
-					WRITE_ONCE(g_ac_last_uid, uid);
-					if (uid && ac_uid_listed(uid))
-						atomic64_inc(&g_ac_uid_hit);
-				}
 				return 0;
 			}
 		}
@@ -955,6 +1028,18 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 			seq_puts(m, "\n");
 		}
 	}
+	{
+		u32 i, n = READ_ONCE(g_ac_hdump_len);
+		if (n) {
+			if (n > AC_HDUMP_BYTES)
+				n = AC_HDUMP_BYTES;
+			seq_printf(m, "ac_hdump off=%d ",
+				   (int)READ_ONCE(g_ac_hdump_off));
+			for (i = 0; i < n; i++)
+				seq_printf(m, "%02x", g_ac_hdump[i]);
+			seq_puts(m, "\n");
+		}
+	}
 	return 0;
 }
 
@@ -1121,6 +1206,13 @@ atomic64_set(&g_ac_uid_hit, 0);
 atomic64_set(&g_ac_big, 0);
 atomic64_set(&g_ac_bad, 0);
 atomic64_set(&g_ac_nosym, 0);
+WRITE_ONCE(g_ac_dump_len, 0);
+WRITE_ONCE(g_ac_hdump_len, 0);
+WRITE_ONCE(g_ac_last_pid, -1);
+WRITE_ONCE(g_ac_last_uid, 0);
+WRITE_ONCE(g_ac_last_bytes, 0);
+WRITE_ONCE(g_ac_last_key, -1);
+WRITE_ONCE(g_ac_last_keyoff, 0);
 } else {
 return -EINVAL;
 }
