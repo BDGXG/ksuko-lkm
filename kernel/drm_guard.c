@@ -567,7 +567,11 @@ static atomic64_t g_kb_big, g_kb_nouid;
  * 用来判定死机到底来自 "读 dest 内存" 还是 "hook 本身"。 */
 static atomic64_t g_kb_sz[4];	/* <=64 / <=256 / <=1K / <=4K */
 static atomic64_t g_kb_bytesum;
-#define KB_VERBOSE 0		/* 1 = v7.1 行为（真扫描），0 = 只计数 */
+static atomic64_t g_kb_bad;	/* dest 不在内核高半区 / 越界读数 */
+static atomic64_t g_kb_rd;	/* B 阶段已真正读过的 parcel 数 */
+#define KB_VERBOSE 2		/* 0=只计数 1=v7.1 全量扫描 2=只读前 64B 扫描 */
+#define KB_READ_BYTES 64	/* v7.3-B：最多读这么多字节，命中 4+16*2 足够 */
+#define KB_READ_CAP  2000	/* B 阶段一次 arm 最多真正读这么多 parcel */
 static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能 unregister，
 			 * 只把后续扫描全部短路，proc 里能看到 stop=1 */
 /* v7.1 硬上限：kretprobe 跑在 atomic 上下文，全系统 binder reply 高频，
@@ -648,6 +652,8 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 {
 	struct kb_req *rq = (struct kb_req *)ri->data;
 	u32 bytes = rq->bytes, off = 0, n;
+	u8 tmp[KB_READ_BYTES];
+	u64 da;
 	int bk;
 	(void)regs;
 	if (!rq->dest || !bytes)
@@ -656,7 +662,35 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 		return 0;
 	atomic64_inc(&g_kb_scan);
 	atomic64_add(bytes, &g_kb_bytesum);
-#if KB_VERBOSE
+#if KB_VERBOSE == 0
+	/* v7.2-A：不碰 dest 内存，只做长度分桶，判定死机来源 */
+	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
+	atomic64_inc(&g_kb_sz[bk]);
+	(void)off;
+	(void)n;
+#elif KB_VERBOSE == 2
+	/* v7.3-B：只读前 64 字节，且先校验地址在内核高半区 */
+	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
+	atomic64_inc(&g_kb_sz[bk]);
+	if (bytes < 4 + AID_LEN * 2)
+		return 0;
+	da = (u64)(unsigned long)rq->dest;
+	if (da < 0xffff000000000000ULL) {
+		atomic64_inc(&g_kb_bad);
+		return 0;
+	}
+	if (atomic64_inc_return(&g_kb_rd) > KB_READ_CAP)
+		return 0;
+	n = bytes < KB_READ_BYTES ? bytes : KB_READ_BYTES;
+	memcpy(tmp, rq->dest, n);
+	if (!kb_find_aid(tmp, n, &off))
+		return 0;
+	atomic64_inc(&g_kb_hit);
+	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停：不再反复读 */
+	atomic64_set(&g_kb_off, off);
+	memcpy(g_ac_dump, tmp, n);
+	WRITE_ONCE(g_ac_dump_len, n);
+#else
 	if (!kb_find_aid((const u8 *)rq->dest, bytes, &off))
 		return 0;
 	atomic64_inc(&g_kb_hit);
@@ -667,12 +701,6 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 		n = AC_DUMP_BYTES;
 	memcpy(g_ac_dump, rq->dest, n);
 	WRITE_ONCE(g_ac_dump_len, n);
-#else
-	/* v7.2-A：不碰 dest 内存，只做长度分桶，判定死机来源 */
-	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
-	atomic64_inc(&g_kb_sz[bk]);
-	(void)off;
-	(void)n;
 #endif
 	return 0;
 }
@@ -707,6 +735,8 @@ static int ac_arm_locked(void)
 	atomic64_set(&g_kb_nouid, 0);
 	memset(g_kb_sz, 0, sizeof(g_kb_sz));
 	atomic64_set(&g_kb_bytesum, 0);
+	atomic64_set(&g_kb_bad, 0);
+	atomic64_set(&g_kb_rd, 0);
 	g_kb_rp.kp.symbol_name = "binder_alloc_copy_from_buffer";
 	g_kb_rp.entry_handler = kb_entry_handler;
 	g_kb_rp.handler = kb_ret_handler;
@@ -1262,6 +1292,8 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		READ_ONCE(g_kb_stop) ? 1 : 0,
 		atomic64_read(&g_kb_big), atomic64_read(&g_kb_nouid),
 		KB_SCAN_CAP, KB_MAX_BYTES);
+	seq_printf(m, "kb rd=%lld bad=%lld\n",
+		atomic64_read(&g_kb_rd), atomic64_read(&g_kb_bad));
 	seq_printf(m, "kb sz 64=%lld 256=%lld 1k=%lld 4k=%lld sum=%lld v=%d\n",
 		atomic64_read(&g_kb_sz[0]), atomic64_read(&g_kb_sz[1]),
 		atomic64_read(&g_kb_sz[2]), atomic64_read(&g_kb_sz[3]),
@@ -1466,6 +1498,8 @@ atomic64_set(&g_kb_big, 0);
 atomic64_set(&g_kb_nouid, 0);
 memset(g_kb_sz, 0, sizeof(g_kb_sz));
 atomic64_set(&g_kb_bytesum, 0);
+atomic64_set(&g_kb_bad, 0);
+atomic64_set(&g_kb_rd, 0);
 WRITE_ONCE(g_kb_stop, false);
 WRITE_ONCE(g_ac_last_dstpid, -1);
 WRITE_ONCE(g_ac_last_dstuid, 0);
