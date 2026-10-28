@@ -269,6 +269,11 @@ static u32 g_ac_last_uid;
 static u32 g_ac_last_bytes;
 static int g_ac_last_key = -1;	/* -1 none, 0 "value", 1 "android_id" */
 static u32 g_ac_last_keyoff;	/* 首个 key 命中在 parcel 内的偏移 */
+/* key 命中处的原始字节快照（hex 打印）：值可能是 UTF-16 也可能是
+ * ASCII byte[]，先把现场留证，再决定匹配规则。 */
+#define AC_DUMP_BYTES 96
+static u8 g_ac_dump[AC_DUMP_BYTES];
+static u32 g_ac_dump_len;
 static size_t g_ac_pid_off = (size_t)-1;
 static size_t g_ac_cred_uid_off = 8;
 static bool g_ac_cred_uid_ok;
@@ -351,6 +356,13 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 			WRITE_ONCE(g_ac_last_bytes, (u32)bytes);
 			WRITE_ONCE(g_ac_last_keyoff, pos);
 			WRITE_ONCE(g_ac_last_key, (int)k);
+			{
+				u32 dl = bytes - pos;
+				if (dl > AC_DUMP_BYTES)
+					dl = AC_DUMP_BYTES;
+				memcpy(g_ac_dump, ac_buf + pos, dl);
+				WRITE_ONCE(g_ac_dump_len, dl);
+			}
 			for (q = pos + klen;
 			     q + 4 + AID_LEN * 2 <= bytes; q++) {
 				u32 len;
@@ -932,6 +944,17 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		READ_ONCE(g_ac_last_pid), READ_ONCE(g_ac_last_uid),
 		(int)READ_ONCE(g_ac_last_bytes), READ_ONCE(g_ac_last_key),
 		(int)READ_ONCE(g_ac_last_keyoff));
+	{
+		u32 i, n = READ_ONCE(g_ac_dump_len);
+		if (n) {
+			if (n > AC_DUMP_BYTES)
+				n = AC_DUMP_BYTES;
+			seq_puts(m, "ac_dump ");
+			for (i = 0; i < n; i++)
+				seq_printf(m, "%02x", g_ac_dump[i]);
+			seq_puts(m, "\n");
+		}
+	}
 	return 0;
 }
 
