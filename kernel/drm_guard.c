@@ -563,6 +563,11 @@ static struct kretprobe g_kb_rp;
 static atomic64_t g_kb_calls, g_kb_scan, g_kb_hit;
 static atomic64_t g_kb_off;
 static atomic64_t g_kb_big, g_kb_nouid;
+/* v7.2-A 诊断模式：ret 阶段完全不读 dest，只统计 parcel 长度分布，
+ * 用来判定死机到底来自 "读 dest 内存" 还是 "hook 本身"。 */
+static atomic64_t g_kb_sz[4];	/* <=64 / <=256 / <=1K / <=4K */
+static atomic64_t g_kb_bytesum;
+#define KB_VERBOSE 0		/* 1 = v7.1 行为（真扫描），0 = 只计数 */
 static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能 unregister，
 			 * 只把后续扫描全部短路，proc 里能看到 stop=1 */
 /* v7.1 硬上限：kretprobe 跑在 atomic 上下文，全系统 binder reply 高频，
@@ -571,7 +576,7 @@ static bool g_kb_stop;	/* 命中或超上限后置位：原子上下文里不能
 #define KB_SCAN_CAP   20000	/* 一次 arm 期间最多扫这么多 parcel */
 /* 在 kernel buffer 里找 [int32 len=16][16 位 hex]，UTF-16LE 与 ASCII 都试。
  * 先用 memchr 找 0x10 字节做 O(1) 预过滤，避免对 4KB 逐字节跑循环。 */
-static bool __nocfi noinline kb_find_aid(const u8 *b, u32 bytes, u32 *out)
+static bool __maybe_unused __nocfi noinline kb_find_aid(const u8 *b, u32 bytes, u32 *out)
 {
 	u32 q = 0, i;
 	u32 last;
@@ -643,12 +648,15 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 {
 	struct kb_req *rq = (struct kb_req *)ri->data;
 	u32 bytes = rq->bytes, off = 0, n;
+	int bk;
 	(void)regs;
 	if (!rq->dest || !bytes)
 		return 0;
 	if (READ_ONCE(g_kb_stop))
 		return 0;
 	atomic64_inc(&g_kb_scan);
+	atomic64_add(bytes, &g_kb_bytesum);
+#if KB_VERBOSE
 	if (!kb_find_aid((const u8 *)rq->dest, bytes, &off))
 		return 0;
 	atomic64_inc(&g_kb_hit);
@@ -659,6 +667,13 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 		n = AC_DUMP_BYTES;
 	memcpy(g_ac_dump, rq->dest, n);
 	WRITE_ONCE(g_ac_dump_len, n);
+#else
+	/* v7.2-A：不碰 dest 内存，只做长度分桶，判定死机来源 */
+	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
+	atomic64_inc(&g_kb_sz[bk]);
+	(void)off;
+	(void)n;
+#endif
 	return 0;
 }
 static int ac_arm_locked(void)
@@ -690,6 +705,8 @@ static int ac_arm_locked(void)
 	atomic64_set(&g_kb_off, 0);
 	atomic64_set(&g_kb_big, 0);
 	atomic64_set(&g_kb_nouid, 0);
+	memset(g_kb_sz, 0, sizeof(g_kb_sz));
+	atomic64_set(&g_kb_bytesum, 0);
 	g_kb_rp.kp.symbol_name = "binder_alloc_copy_from_buffer";
 	g_kb_rp.entry_handler = kb_entry_handler;
 	g_kb_rp.handler = kb_ret_handler;
@@ -1245,6 +1262,10 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		READ_ONCE(g_kb_stop) ? 1 : 0,
 		atomic64_read(&g_kb_big), atomic64_read(&g_kb_nouid),
 		KB_SCAN_CAP, KB_MAX_BYTES);
+	seq_printf(m, "kb sz 64=%lld 256=%lld 1k=%lld 4k=%lld sum=%lld v=%d\n",
+		atomic64_read(&g_kb_sz[0]), atomic64_read(&g_kb_sz[1]),
+		atomic64_read(&g_kb_sz[2]), atomic64_read(&g_kb_sz[3]),
+		atomic64_read(&g_kb_bytesum), KB_VERBOSE);
 	{
 		u32 i, n = READ_ONCE(g_ac_dump_len);
 		if (n) {
@@ -1443,6 +1464,8 @@ atomic64_set(&g_kb_hit, 0);
 atomic64_set(&g_kb_off, 0);
 atomic64_set(&g_kb_big, 0);
 atomic64_set(&g_kb_nouid, 0);
+memset(g_kb_sz, 0, sizeof(g_kb_sz));
+atomic64_set(&g_kb_bytesum, 0);
 WRITE_ONCE(g_kb_stop, false);
 WRITE_ONCE(g_ac_last_dstpid, -1);
 WRITE_ONCE(g_ac_last_dstuid, 0);
