@@ -280,6 +280,13 @@ static u32 g_ac_dump_len;
 static u8 g_ac_hdump[AC_HDUMP_BYTES];
 static u32 g_ac_hdump_len;
 static u32 g_ac_hdump_off;
+/* 反向（reply）方向：这个 hook 同时也承担 server->client 的数据装载。
+ * 那种调用里 alloc 属于接收方（目标 app），alloc->pid 反查出的 uid
+ * 就是目标进程；current 则是发送方（如 system_server, uid 1000）。
+ * 因此 must 用 alloc->pid 判定 uid，才能在回复 parcel 里抓到 aid。 */
+static atomic64_t g_ac_dst_scan, g_ac_dst_hit;
+static int g_ac_last_dstpid = -1;
+static u32 g_ac_last_dstuid;
 static size_t g_ac_pid_off = (size_t)-1;
 static size_t g_ac_cred_uid_off = 8;
 static bool g_ac_cred_uid_ok;
@@ -373,6 +380,56 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 	}
 	atomic64_inc(&g_ac_scan);
+	/* 反向方向优先：若这份 parcel 的落点（alloc->pid）是白名单进程，
+	 * 说明数据正被装进目标 app 的 binder buffer —— aid 就在这块数据里
+	 * （由 system_server 的字符串 reply 携带）。直接整块扫 16 位 hex。 */
+	{
+		int dstpid = -1;
+		u32 duid = 0;
+		if (alloc && g_ac_pid_off != (size_t)-1)
+			memcpy(&dstpid, (char *)alloc + g_ac_pid_off,
+			       sizeof(dstpid));
+		if (dstpid > 0)
+			duid = ac_pid_to_uid(dstpid);
+		if (duid && ac_uid_listed(duid)) {
+			u32 q2, hitq = 0;
+			bool found = false;
+			atomic64_inc(&g_ac_dst_scan);
+			for (q2 = 0; q2 + 4 + AID_LEN * 2 <= bytes; q2++) {
+				u32 len;
+				memcpy(&len, ac_buf + q2, 4);
+				if (len != AID_LEN)
+					continue;
+				for (i = 0; i < AID_LEN; i++) {
+					u8 lo = ac_buf[q2 + 4 + i * 2];
+					u8 hi = ac_buf[q2 + 4 + i * 2 + 1];
+					if (hi != 0 || !aid_is_hex(lo))
+						break;
+				}
+				if (i == AID_LEN) {
+					hitq = q2;
+					found = true;
+					break;
+				}
+				for (i = 0; i < AID_LEN; i++)
+					if (!aid_is_hex(ac_buf[q2 + 4 + i]))
+						break;
+				if (i == AID_LEN) {
+					hitq = q2;
+					found = true;
+					break;
+				}
+			}
+			if (found) {
+				ac_rec_hit(alloc, (u32)bytes, hitq, -2);
+				WRITE_ONCE(g_ac_last_dstpid, dstpid);
+				WRITE_ONCE(g_ac_last_dstuid, duid);
+				atomic64_inc(&g_ac_dst_hit);
+				spin_unlock(&ac_lock);
+				return 0;
+			}
+		}
+	}
 	/* 白名单 uid 的 parcel：不看 key，直接在整块数据里找 16 位 hex 值。
 	 * Bundle 里的 String 布局是 int32 长度=16 紧跟 16 个字符，
 	 * UTF-16LE 与 ASCII 两种编码都试，命中即取证返回。 */
@@ -1017,6 +1074,9 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		READ_ONCE(g_ac_last_pid), READ_ONCE(g_ac_last_uid),
 		(int)READ_ONCE(g_ac_last_bytes), READ_ONCE(g_ac_last_key),
 		(int)READ_ONCE(g_ac_last_keyoff));
+	seq_printf(m, "ac_dst scan=%lld hit=%lld lastpid=%d lastuid=%d\n",
+		atomic64_read(&g_ac_dst_scan), atomic64_read(&g_ac_dst_hit),
+		READ_ONCE(g_ac_last_dstpid), READ_ONCE(g_ac_last_dstuid));
 	{
 		u32 i, n = READ_ONCE(g_ac_dump_len);
 		if (n) {
@@ -1206,6 +1266,10 @@ atomic64_set(&g_ac_uid_hit, 0);
 atomic64_set(&g_ac_big, 0);
 atomic64_set(&g_ac_bad, 0);
 atomic64_set(&g_ac_nosym, 0);
+atomic64_set(&g_ac_dst_scan, 0);
+atomic64_set(&g_ac_dst_hit, 0);
+WRITE_ONCE(g_ac_last_dstpid, -1);
+WRITE_ONCE(g_ac_last_dstuid, 0);
 WRITE_ONCE(g_ac_dump_len, 0);
 WRITE_ONCE(g_ac_hdump_len, 0);
 WRITE_ONCE(g_ac_last_pid, -1);
