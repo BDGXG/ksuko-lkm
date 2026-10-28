@@ -622,7 +622,7 @@ static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 	if (!kb_find_aid((const u8 *)rq->dest, bytes, &off))
 		return 0;
 	atomic64_inc(&g_kb_hit);
-	WRITE_ONCE(g_kb_off, off);
+	atomic64_set(&g_kb_off, off);
 	n = bytes;
 	if (n > AC_DUMP_BYTES)
 		n = AC_DUMP_BYTES;
