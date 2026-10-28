@@ -258,7 +258,7 @@ out:
  * task->cred->uid；命中 g_uids 白名单单独计数（uid_hit）。
  * 默认关闭，proc 里 "aidcopy 1" 才 arm。
  * ===================================================================== */
-#define AC_SCAN_BYTES 4096
+#define AC_SCAN_BYTES 16384
 static bool g_ac_enable;
 static u8 ac_buf[AC_SCAN_BYTES];
 static DEFINE_SPINLOCK(ac_lock);
@@ -268,6 +268,7 @@ static int g_ac_last_pid = -1;
 static u32 g_ac_last_uid;
 static u32 g_ac_last_bytes;
 static int g_ac_last_key = -1;	/* -1 none, 0 "value", 1 "android_id" */
+static u32 g_ac_last_keyoff;	/* 首个 key 命中在 parcel 内的偏移 */
 static size_t g_ac_pid_off = (size_t)-1;
 static size_t g_ac_cred_uid_off = 8;
 static bool g_ac_cred_uid_ok;
@@ -340,8 +341,18 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 			if (memcmp(ac_buf + pos, aid_keys[k].p, klen))
 				continue;
 			atomic64_inc(&g_ac_key);
+			/* key 命中就先把发送方快照下来：即使后面找不到 16 位
+			 * 回值，也能从 ac_last 看出「哪个 pid、多大 parcel、
+			 * key 落在第几个字节」，用来判断截断/偏移问题。 */
+			if (alloc && g_ac_pid_off != (size_t)-1)
+				memcpy(&pid, (char *)alloc + g_ac_pid_off,
+				       sizeof(pid));
+			WRITE_ONCE(g_ac_last_pid, pid);
+			WRITE_ONCE(g_ac_last_bytes, (u32)bytes);
+			WRITE_ONCE(g_ac_last_keyoff, pos);
+			WRITE_ONCE(g_ac_last_key, (int)k);
 			for (q = pos + klen;
-			     q + 4 + AID_LEN * 2 <= bytes && q < pos + 256; q++) {
+			     q + 4 + AID_LEN * 2 <= bytes; q++) {
 				u32 len;
 
 				memcpy(&len, ac_buf + q, 4);
@@ -917,9 +928,10 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 	seq_printf(m, "ac_big=%lld ac_bad=%lld ac_nosym=%lld\n",
 		atomic64_read(&g_ac_big), atomic64_read(&g_ac_bad),
 		atomic64_read(&g_ac_nosym));
-	seq_printf(m, "ac_last pid=%d uid=%d bytes=%d key=%d\n",
+	seq_printf(m, "ac_last pid=%d uid=%d bytes=%d key=%d koff=%d\n",
 		READ_ONCE(g_ac_last_pid), READ_ONCE(g_ac_last_uid),
-		(int)READ_ONCE(g_ac_last_bytes), READ_ONCE(g_ac_last_key));
+		(int)READ_ONCE(g_ac_last_bytes), READ_ONCE(g_ac_last_key),
+		(int)READ_ONCE(g_ac_last_keyoff));
 	return 0;
 }
 
