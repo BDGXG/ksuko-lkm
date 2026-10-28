@@ -276,7 +276,10 @@ static bool g_ac_armed;
 static struct task_struct *(*ac_find_task_fn)(pid_t);
 static const struct cred *(*ac_task_cred_fn)(struct task_struct *);
 
-static u32 ac_pid_to_uid(int pid)
+/* noinline __nocfi: 两次间接调用（find_get_task_by_vpid / get_task_cred 都是
+ * kallsyms 解析出来的地址）。CFI 检查的是 call site，模块里没有对应的类型
+ * 信息，真机上会在 ldur 处 panic —— 与 ksu_allow_gate.c 同一处理。 */
+static u32 __nocfi noinline ac_pid_to_uid(int pid)
 {
 	struct task_struct *tsk;
 	const struct cred *cred;
@@ -306,7 +309,7 @@ static bool ac_uid_listed(u32 uid)
 	return false;
 }
 
-static int ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
+static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	void *alloc = (void *)regs->regs[0];
 	const void __user *from = (const void __user *)regs->regs[3];
