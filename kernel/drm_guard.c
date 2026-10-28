@@ -285,6 +285,7 @@ static u32 g_ac_hdump_off;
  * 就是目标进程；current 则是发送方（如 system_server, uid 1000）。
  * 因此 must 用 alloc->pid 判定 uid，才能在回复 parcel 里抓到 aid。 */
 static atomic64_t g_ac_dst_scan, g_ac_dst_hit;
+static atomic64_t g_ac_dst_seen;
 static int g_ac_last_dstpid = -1;
 static u32 g_ac_last_dstuid;
 static size_t g_ac_pid_off = (size_t)-1;
@@ -355,6 +356,27 @@ static void ac_rec_hit(void *alloc, u32 bytes, u32 q, int k)
 	}
 }
 
+/* 分页只读拷贝：整块 copy_from_user_nofault 只要有一页未驻留就整体失败，
+ * 实测大量 parcel 因此被丢弃（ac_bad 远大于 ac_scan）。改成一页一页抄，
+ * 失败的页清零跳过，既不会触发缺页也照样读到已驻留的部分。全程只读。 */
+static u32 __nocfi noinline ac_copy_in(const void __user *from, u32 bytes)
+{
+	u32 off = 0, good = 0;
+	const char __user *p = (const char __user *)from;
+
+	while (off < bytes) {
+		u32 chunk = bytes - off;
+		if (chunk > 4096)
+			chunk = 4096;
+		if (copy_from_user_nofault(ac_buf + off, p + off, chunk))
+			memset(ac_buf + off, 0, chunk);
+		else
+			good += chunk;
+		off += chunk;
+	}
+	return good;
+}
+
 static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	void *alloc = (void *)regs->regs[0];
@@ -374,7 +396,7 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	}
 	if (!spin_trylock(&ac_lock))
 		return 0;
-	if (copy_from_user_nofault(ac_buf, from, bytes)) {
+	if (!ac_copy_in(from, bytes)) {
 		atomic64_inc(&g_ac_bad);
 		spin_unlock(&ac_lock);
 		return 0;
@@ -394,6 +416,7 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		if (duid && ac_uid_listed(duid)) {
 			u32 q2, hitq = 0;
 			bool found = false;
+			atomic64_inc(&g_ac_dst_seen);
 			atomic64_inc(&g_ac_dst_scan);
 			for (q2 = 0; q2 + 4 + AID_LEN * 2 <= bytes; q2++) {
 				u32 len;
@@ -1077,6 +1100,7 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 	seq_printf(m, "ac_dst scan=%lld hit=%lld lastpid=%d lastuid=%d\n",
 		atomic64_read(&g_ac_dst_scan), atomic64_read(&g_ac_dst_hit),
 		READ_ONCE(g_ac_last_dstpid), READ_ONCE(g_ac_last_dstuid));
+	seq_printf(m, "ac_dst_seen=%lld\n", atomic64_read(&g_ac_dst_seen));
 	{
 		u32 i, n = READ_ONCE(g_ac_dump_len);
 		if (n) {
@@ -1268,6 +1292,7 @@ atomic64_set(&g_ac_bad, 0);
 atomic64_set(&g_ac_nosym, 0);
 atomic64_set(&g_ac_dst_scan, 0);
 atomic64_set(&g_ac_dst_hit, 0);
+atomic64_set(&g_ac_dst_seen, 0);
 WRITE_ONCE(g_ac_last_dstpid, -1);
 WRITE_ONCE(g_ac_last_dstuid, 0);
 WRITE_ONCE(g_ac_dump_len, 0);
