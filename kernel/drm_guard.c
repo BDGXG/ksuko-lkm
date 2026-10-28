@@ -6,7 +6,7 @@
  * copy_from_user() 在页不存在时会走缺页流程、可能睡眠 -> scheduling while
  * atomic，而 binder_ioctl 是每秒上万次的热点，于是 binder 线程池被钉死。
  * 这里用户内存一律 copy_*_user_nofault()（内部 pagefault_disable，不睡眠），
- * 缓冲区改用 per-CPU 静态块，不再 kmalloc(GFP_ATOMIC)。
+ * 缓冲区改用模块静态块 + spinlock，不再 kmalloc(GFP_ATOMIC)。
  *
  * 触发模型（M1.5 实测）：请求和回复经常不在同一次 ioctl；BR_REPLY 的 code
  * 恒为 0、sender_pid 恒为 0，回复无法自证身份。因此只能靠「40 字节的
@@ -18,19 +18,26 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
+#include <linux/sched/task.h>
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/atomic.h>
 #include <linux/jiffies.h>
 #include <linux/percpu.h>
 #include <linux/random.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/cred.h>
+#include <linux/pid.h>
 #include <uapi/linux/android/binder.h>
 
 #include "drm_guard.h"
+#include "btf_layout.h"
+#include "symbol_resolver.h"
+#include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 
 #define DRM_ID_BYTES 32
 #define DRM_PARCEL_BYTES (8 + DRM_ID_BYTES)
@@ -61,10 +68,12 @@ atomic64_t e_scan, e_gate, e_write;
 atomic64_t kaddr_hits;
 };
 
-static int g_dump40;
 static struct drm_stats g_stats;
 
-static bool drm_uid_allowed(void)
+/* 导出给 taint_spoof：同一份 target uid 白名单，避免维护两套配置。
+ * 只读 g_uid_count / g_uids，无锁；写入侧用 WRITE_ONCE + mutex，
+ * 读到半更新的列表最多是「多放行一个 uid」，不会越界。 */
+bool drm_uid_allowed(void)
 {
 u32 uid = __kuid_val(current_uid());
 u32 i, n = READ_ONCE(g_uid_count);
@@ -75,6 +84,11 @@ for (i = 0; i < n && i < DRM_UID_LIMIT; i++)
 if (READ_ONCE(g_uids[i]) == uid)
 return true;
 return false;
+}
+
+u32 drm_uid_count(void)
+{
+return READ_ONCE(g_uid_count);
 }
 
 static inline unsigned long drm_untag(unsigned long a)
@@ -96,15 +110,331 @@ return 0;
 
 static int drm_u_write(void __user *dst, const void *src, size_t n)
 {
-if (copy_to_user_nofault(dst, src, n) && copy_to_user(dst, src, n)) {
+if (copy_to_user_nofault(dst, src, n)) {
+if (copy_to_user(dst, src, n)) {
+if (copy_to_kernel_nofault((void *)dst, src, n)) {
 atomic64_inc(&g_stats.nofault_fail);
 return -EFAULT;
+}
+atomic64_inc(&g_stats.kaddr_hits);
+}
 }
 return 0;
 }
 
-static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td);
+/* =====================================================================
+ * android_id guard
+ *
+ * 目标：拦截 ContentResolver.call("GET_secure","android_id") 的 binder
+ * 回复，把 Bundle 里的 16 位 hex 值原地替换成配置的假值。
+ *
+ * 为什么走 binder reply 而不是 SettingsProvider 存储：
+ *   - 改 /data/system/users/0/settings_secure.xml 需要重启 system_server
+ *     或刷新 SettingsProvider 缓存，风险高（实测会死机）。
+ *   - Android 8+ 的 android_id 是 per-app 派生值（HMAC(真值, 签名)），
+ *     存储真值改了也不等于目标 app 读到新值。
+ *   - 游戏读 android_id 的真实路径是 ContentResolver.call -> binder ->
+ *     system_server，回复 parcel 里就是派生后的 16 位 hex，直接改这里
+ *     最贴近"目标 app 看到什么"。
+ *
+ * 匹配策略（宽松，不依赖 Bundle 精确布局）：
+ *   1. 在 reply parcel 里搜 UTF-16LE 的 "android_id"（10 字符 = 20 字节）
+ *   2. 从 key 之后向后最多 256 字节，找 [len=16][16 个 UTF-16 hex]
+ *   3. 命中即原地改写这 16 个字符
+ *   只对 uid 白名单（复用 drm 的 target_uids）生效，默认 dry-run。
+ * ===================================================================== */
+#define AID_LEN 16
+#define AID_SCAN_BYTES 4096
+static char g_aid[AID_LEN + 1];
+static bool g_aid_enable;
+static bool g_aid_apply;
+static atomic64_t g_aid_scan, g_aid_key_hits, g_aid_hits, g_aid_written;
+/* 扫描缓冲：模块 .bss 里一块 4KB 静态区，用 spinlock 串行化。
+ * 不能用 DEFINE_PER_CPU —— 模块 per-cpu 预留区只有 8KB，
+ * 4KB/CPU x 8 CPU 会在 load_module 阶段直接 ENOMEM（实测 rc=139）。
+ * kretprobe 上下文不能睡眠，抢不到锁就跳过这一包。 */
+static u8 aid_buf[AID_SCAN_BYTES];
+static DEFINE_SPINLOCK(aid_lock);
+/* SettingsProvider GET_secure 的回复 Bundle 里 key 是 "value"（AOSP
+ * Settings.NameValueTable.VALUE）；"android_id" 是请求参数，通常只在
+ * 请求 parcel 里。两个都试，谁命中算谁。 */
+static const u8 aid_key_value[] = {
+	'v', 0, 'a', 0, 'l', 0, 'u', 0, 'e', 0,
+};
+static const u8 aid_key_androidid[] = {
+	'a', 0, 'n', 0, 'd', 0, 'r', 0, 'o', 0,
+	'i', 0, 'd', 0, '_', 0, 'i', 0, 'd', 0,
+};
+struct aid_key { const u8 *p; u32 chars; };
+static const struct aid_key aid_keys[] = {
+	{ aid_key_value, 5 },
+	{ aid_key_androidid, 10 },
+};
+static inline bool aid_is_hex(u8 c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+	       (c >= 'A' && c <= 'F');
+}
+static bool aid_try_patch(struct binder_transaction_data *td)
+{
+	void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
+	u8 *buf;
+	size_t total, pos, q, i;
+	u32 k, klen;
+	bool ret = false;
 
+	if (!parcel || !READ_ONCE(g_aid_enable))
+		return false;
+	if (td->data_size < 64)
+		return false;
+	total = min_t(size_t, td->data_size, (size_t)AID_SCAN_BYTES);
+	if (!spin_trylock(&aid_lock))
+		return false;
+	buf = aid_buf;
+	if (drm_u_read(buf, parcel, total))
+		goto out;
+	atomic64_inc(&g_aid_scan);
+
+	for (k = 0; k < ARRAY_SIZE(aid_keys); k++) {
+		klen = aid_keys[k].chars * 2;
+		for (pos = 0; pos + klen <= total; pos++) {
+			if (memcmp(buf + pos, aid_keys[k].p, klen))
+				continue;
+			atomic64_inc(&g_aid_key_hits);
+			for (q = pos + klen;
+			     q + 4 + AID_LEN * 2 <= total && q < pos + 256; q++) {
+				u32 len;
+
+				memcpy(&len, buf + q, 4);
+				if (len != AID_LEN)
+					continue;
+				for (i = 0; i < AID_LEN; i++) {
+					u8 lo = buf[q + 4 + i * 2];
+					u8 hi = buf[q + 4 + i * 2 + 1];
+
+					if (hi != 0 || !aid_is_hex(lo))
+						break;
+				}
+				if (i != AID_LEN)
+					continue;
+				atomic64_inc(&g_aid_hits);
+				if (!READ_ONCE(g_aid_apply))
+					goto out;
+				{
+					u8 fake[AID_LEN * 2];
+
+					for (i = 0; i < AID_LEN; i++) {
+						fake[i * 2] = (u8)g_aid[i];
+						fake[i * 2 + 1] = 0;
+					}
+					if (drm_u_write((u8 __user *)parcel + q + 4,
+							fake, AID_LEN * 2))
+						goto out;
+					atomic64_inc(&g_aid_written);
+				}
+				ret = true;
+				goto out;
+			}
+		}
+	}
+out:
+	spin_unlock(&aid_lock);
+	return ret;
+}
+
+/* =====================================================================
+ * aidcopy probe (M3, dry-run only)
+ *
+ * 旧 aid 段改的是 binder_ioctl 返回后 td->data.ptr.buffer 指向的用户态
+ * vma（PROT_READ），drm_u_write 必然 EFAULT：真机上 aid_written 恒 0。
+ * 这一版只观察 parcel 真正的落点——binder_transaction() 里唯一装载
+ * parcel 明文的调用 binder_alloc_copy_user_to_buffer(alloc, buffer,
+ * buffer_offset, from, bytes)，入口的 from/bytes 就是发送方 parcel 的
+ * 起始地址与长度。全程只读：copy_from_user_nofault 拷进模块静态缓冲
+ * 扫 UTF-16 key，一个字节都不写。命中即证明目标进程的 parcel 里确实
+ * 携带 16 位 hex 回值，为后续在 buffer 内核地址上改写铺路。
+ *
+ * 目标进程判定：alloc 属于接收方（target_proc），alloc->pid 反查
+ * task->cred->uid；命中 g_uids 白名单单独计数（uid_hit）。
+ * 默认关闭，proc 里 "aidcopy 1" 才 arm。
+ * ===================================================================== */
+#define AC_SCAN_BYTES 4096
+static bool g_ac_enable;
+static u8 ac_buf[AC_SCAN_BYTES];
+static DEFINE_SPINLOCK(ac_lock);
+static atomic64_t g_ac_calls, g_ac_scan, g_ac_key, g_ac_hit, g_ac_uid_hit;
+static atomic64_t g_ac_big, g_ac_bad, g_ac_nosym;
+static int g_ac_last_pid = -1;
+static u32 g_ac_last_uid;
+static u32 g_ac_last_bytes;
+static int g_ac_last_key = -1;	/* -1 none, 0 "value", 1 "android_id" */
+static size_t g_ac_pid_off = (size_t)-1;
+static size_t g_ac_cred_uid_off = 8;
+static bool g_ac_cred_uid_ok;
+static struct kprobe g_ac_kp;
+static bool g_ac_armed;
+static struct task_struct *(*ac_find_task_fn)(pid_t);
+static const struct cred *(*ac_task_cred_fn)(struct task_struct *);
+
+static u32 ac_pid_to_uid(int pid)
+{
+	struct task_struct *tsk;
+	const struct cred *cred;
+	u32 uid = 0;
+
+	if (!ac_find_task_fn || !ac_task_cred_fn || !g_ac_cred_uid_ok || pid <= 0)
+		return 0;
+	tsk = ac_find_task_fn(pid);
+	if (!tsk)
+		return 0;
+	cred = ac_task_cred_fn(tsk);
+	if (cred) {
+		memcpy(&uid, (const char *)cred + g_ac_cred_uid_off, sizeof(uid));
+		put_cred(cred);
+	}
+	put_task_struct(tsk);
+	return uid;
+}
+
+static bool ac_uid_listed(u32 uid)
+{
+	u32 i, n = READ_ONCE(g_uid_count);
+
+	for (i = 0; i < n && i < DRM_UID_LIMIT; i++)
+		if (READ_ONCE(g_uids[i]) == uid)
+			return true;
+	return false;
+}
+
+static int ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	void *alloc = (void *)regs->regs[0];
+	const void __user *from = (const void __user *)regs->regs[3];
+	unsigned long bytes = regs->regs[4];
+	u32 k, klen, pos, q, i;
+	int pid = -1;
+
+	atomic64_inc(&g_ac_calls);
+	if (!from || bytes < 32)
+		return 0;
+	if (!READ_ONCE(g_ac_enable))
+		return 0;
+	if (bytes > AC_SCAN_BYTES) {
+		atomic64_inc(&g_ac_big);
+		bytes = AC_SCAN_BYTES;
+	}
+	if (!spin_trylock(&ac_lock))
+		return 0;
+	if (copy_from_user_nofault(ac_buf, from, bytes)) {
+		atomic64_inc(&g_ac_bad);
+		spin_unlock(&ac_lock);
+		return 0;
+	}
+	atomic64_inc(&g_ac_scan);
+	for (k = 0; k < ARRAY_SIZE(aid_keys); k++) {
+		klen = aid_keys[k].chars * 2;
+		for (pos = 0; pos + klen <= bytes; pos++) {
+			if (memcmp(ac_buf + pos, aid_keys[k].p, klen))
+				continue;
+			atomic64_inc(&g_ac_key);
+			for (q = pos + klen;
+			     q + 4 + AID_LEN * 2 <= bytes && q < pos + 256; q++) {
+				u32 len;
+
+				memcpy(&len, ac_buf + q, 4);
+				if (len != AID_LEN)
+					continue;
+				for (i = 0; i < AID_LEN; i++) {
+					u8 lo = ac_buf[q + 4 + i * 2];
+					u8 hi = ac_buf[q + 4 + i * 2 + 1];
+
+					if (hi != 0 || !aid_is_hex(lo))
+						break;
+				}
+				if (i != AID_LEN)
+					continue;
+				atomic64_inc(&g_ac_hit);
+				if (g_ac_pid_off != (size_t)-1 && alloc)
+					memcpy(&pid, (char *)alloc + g_ac_pid_off,
+					       sizeof(pid));
+				WRITE_ONCE(g_ac_last_pid, pid);
+				WRITE_ONCE(g_ac_last_bytes, (u32)bytes);
+				WRITE_ONCE(g_ac_last_key, (int)k);
+				spin_unlock(&ac_lock);
+				{
+					u32 uid = ac_pid_to_uid(pid);
+
+					WRITE_ONCE(g_ac_last_uid, uid);
+					if (uid && ac_uid_listed(uid))
+						atomic64_inc(&g_ac_uid_hit);
+				}
+				return 0;
+			}
+		}
+	}
+	spin_unlock(&ac_lock);
+	return 0;
+}
+
+static int ac_arm_locked(void)
+{
+	int ret;
+
+	if (g_ac_armed)
+		return 0;
+	g_ac_kp.symbol_name = "binder_alloc_copy_user_to_buffer";
+	g_ac_kp.addr = NULL;
+	g_ac_kp.pre_handler = ac_pre_handler;
+	ret = register_kprobe(&g_ac_kp);
+	if (ret) {
+		g_ac_kp.addr = NULL;
+		pr_warn("aidcopy probe failed on %s: %d\n",
+			g_ac_kp.symbol_name, ret);
+		return ret;
+	}
+	g_ac_armed = true;
+	pr_info("aidcopy probe armed on %s\n", g_ac_kp.symbol_name);
+	return 0;
+}
+
+static void ac_disarm_locked(void)
+{
+	if (!g_ac_armed)
+		return;
+	unregister_kprobe(&g_ac_kp);
+	g_ac_kp.addr = NULL;
+	g_ac_armed = false;
+	pr_info("aidcopy probe disarmed\n");
+}
+
+static void ac_init(void)
+{
+	int rc;
+
+	g_ac_kp.pre_handler = ac_pre_handler;
+	rc = susfs_btf_member_offset("binder_alloc", "pid", "int",
+				     &g_ac_pid_off);
+	if (rc) {
+		g_ac_pid_off = (size_t)-1;
+		pr_warn("aidcopy: binder_alloc.pid unresolved (%d)\n", rc);
+	}
+	rc = susfs_btf_member_offset("cred", "uid", "kuid_t",
+				     &g_ac_cred_uid_off);
+	g_ac_cred_uid_ok = !rc;
+	if (rc) {
+		/* struct cred { atomic_long_t usage; kuid_t uid; ... } */
+		g_ac_cred_uid_off = 8;
+		pr_warn("aidcopy: cred.uid unresolved (%d), assume 8\n", rc);
+	}
+	ac_find_task_fn = (void *)ksu_kallsyms_lookup_name("find_get_task_by_vpid");
+	ac_task_cred_fn = (void *)ksu_kallsyms_lookup_name("get_task_cred");
+	if (!ac_find_task_fn || !ac_task_cred_fn) {
+		atomic64_inc(&g_ac_nosym);
+		pr_warn("aidcopy: uid resolver missing\n");
+	}
+}
+
+static bool drm_patch_write_parcel_loose(struct binder_transaction_data *td);
 static bool drm_try_patch(struct binder_transaction_data *td)
 {
 void __user *parcel = (void __user *)drm_untag((unsigned long)td->data.ptr.buffer);
@@ -202,9 +532,10 @@ if (td.data_size >= 8)
 atomic64_inc(&g_stats.r_ge8);
 if (td.data_size == 40)
 atomic64_inc(&g_stats.r_sz40);
-atomic64_inc(&g_stats.reply_seen);
-drm_try_patch(&td);
-}
+		atomic64_inc(&g_stats.reply_seen);
+		drm_try_patch(&td);
+		aid_try_patch(&td);
+	}
 off += step;
 }
 }
@@ -252,16 +583,6 @@ if (drm_u_read(head, parcel, sizeof(head)))
 return false;
 memcpy(&status, head, 4);
 memcpy(&len, head + 4, 4);
-if (td->data_size == 40 && g_dump40 < 8) {
-    g_dump40++;
-    pr_info("dump40 st=%u len=%u b4=%02x%02x%02x%02x b8=%02x%02x%02x%02x b12=%02x%02x%02x%02x b16=%02x%02x%02x%02x b20=%02x%02x%02x%02x" "\n",
-        status, len,
-        head[4], head[5], head[6], head[7],
-        head[8], head[9], head[10], head[11],
-        head[12], head[13], head[14], head[15],
-        head[16], head[17], head[18], head[19],
-        head[20], head[21], head[22], head[23]);
-}
 if (status != 0 || len != DRM_ID_BYTES)
 return false;
 for (i = 0; i < DRM_ID_BYTES; i++)
@@ -360,10 +681,9 @@ static void drm_scan_request(struct binder_write_read *bwr)
 {
 const u8 __user *stream = (const u8 __user *)drm_untag((unsigned long)bwr->write_buffer);
 u32 cap, want, off = 0;
-
 if (!stream)
 return;
-cap = min_t(u32, bwr->write_consumed, bwr->write_size);
+cap = bwr->write_size;
 want = min_t(u32, cap, DRM_SCAN_BYTES);
 if (!want)
 return;
@@ -414,7 +734,8 @@ break;
 if (cmd == BC_REPLY) {
 if (drm_u_read(&td, stream + off + sizeof(u32), sizeof(td)))
 break;
-drm_patch_write_parcel(&td);
+if (!drm_patch_write_parcel(&td))
+drm_patch_write_parcel_loose(&td);
 }
 off += step;
 }
@@ -424,8 +745,8 @@ static int drm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 {
 struct drm_call_ctx *ctx = (struct drm_call_ctx *)ri->data;
 
-if (!READ_ONCE(g_enable))
-return 1;
+	if (!READ_ONCE(g_enable) && !READ_ONCE(g_aid_enable))
+		return 1;
 if (!drm_uid_allowed()) {
 if (READ_ONCE(g_hal_uid) && __kuid_val(current_uid()) == READ_ONCE(g_hal_uid)) {
 struct binder_write_read wb;
@@ -445,6 +766,14 @@ ctx->arg = regs->regs[2];
 ctx->cmd = (u32)regs->regs[1];
 ctx->reserved = 0;
 atomic64_inc(&g_stats.calls);
+/* [v16.60][P0] 在 entry 侧就开窗口：HAL 的 BC_REPLY 往往在 DevCheck 的
+ * ret_handler 之前发出，若只在 ret 侧设 g_pending，HAL 侧永远错过窗口。 */
+if (ctx->cmd == BINDER_WRITE_READ && ctx->arg) {
+struct binder_write_read wb;
+if (!drm_u_read(&wb, (void __user *)drm_untag((unsigned long)ctx->arg), sizeof(wb)) &&
+    wb.write_size && wb.write_buffer)
+drm_scan_request(&wb);
+}
 return 0;
 }
 
@@ -478,8 +807,6 @@ if (bwr.write_size && bwr.write_consumed)
 drm_scan_write(&bwr);
 return 0;
 }
-if (bwr.write_size && bwr.write_consumed)
-drm_scan_request(&bwr);
 if (!bwr.read_size || !bwr.read_consumed) {
 atomic64_inc(&g_stats.c_noread);
 return 0;
@@ -492,7 +819,7 @@ static struct kretprobe g_krp = {
 .entry_handler = drm_entry_handler,
 .handler = drm_ret_handler,
 .data_size = sizeof(struct drm_call_ctx),
-.maxactive = 32,
+.maxactive = 1024,
 };
 
 static const char *const g_probe_symbols[] = {
@@ -549,6 +876,11 @@ for (i = 0; i < DRM_ID_BYTES; i++)
 seq_printf(m, "%02x", g_vid[i]);
 seq_putc(m, '\n');
 seq_printf(m, "calls=%lld\n", atomic64_read(&g_stats.calls));
+/* [v16.67][P0] nmissed：kretprobe 实例池耗尽时，内核在 pre_handler 里拿不到
+ * 空闲实例，只会把 nmissed 加一、不调用 entry_handler。用户态 watchdog 据此
+ * 精确判定「池耗尽」而不是「只是没流量」。
+ */
+seq_printf(m, "nmissed=%u\n", g_krp.nmissed);
 seq_printf(m, "read_streams=%lld\n", atomic64_read(&g_stats.read_streams));
 seq_printf(m, "reply_seen=%lld\n", atomic64_read(&g_stats.reply_seen));
 seq_printf(m, "exact_hits=%lld\n", atomic64_read(&g_stats.exact_hits));
@@ -567,11 +899,35 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
    atomic64_read(&g_stats.c_cmd), atomic64_read(&g_stats.c_ret),
    atomic64_read(&g_stats.c_arg), atomic64_read(&g_stats.c_bwr),
    atomic64_read(&g_stats.c_noread));
-return 0;
+	seq_printf(m, "aid_enable=%d aid_apply=%d aid=%s\n",
+		READ_ONCE(g_aid_enable), READ_ONCE(g_aid_apply),
+		g_aid[0] ? g_aid : "-");
+	seq_printf(m, "aid_scan=%lld aid_key_hits=%lld aid_hits=%lld aid_written=%lld\n",
+		atomic64_read(&g_aid_scan), atomic64_read(&g_aid_key_hits),
+		atomic64_read(&g_aid_hits), atomic64_read(&g_aid_written));
+	seq_printf(m, "aidcopy_enable=%d ac_armed=%d\n",
+		READ_ONCE(g_ac_enable), READ_ONCE(g_ac_armed));
+	seq_printf(m, "ac_calls=%lld ac_scan=%lld ac_key=%lld ac_hit=%lld ac_uid_hit=%lld\n",
+		atomic64_read(&g_ac_calls), atomic64_read(&g_ac_scan),
+		atomic64_read(&g_ac_key), atomic64_read(&g_ac_hit),
+		atomic64_read(&g_ac_uid_hit));
+	seq_printf(m, "ac_big=%lld ac_bad=%lld ac_nosym=%lld\n",
+		atomic64_read(&g_ac_big), atomic64_read(&g_ac_bad),
+		atomic64_read(&g_ac_nosym));
+	seq_printf(m, "ac_last pid=%d uid=%d bytes=%d key=%d\n",
+		READ_ONCE(g_ac_last_pid), READ_ONCE(g_ac_last_uid),
+		(int)READ_ONCE(g_ac_last_bytes), READ_ONCE(g_ac_last_key));
+	return 0;
 }
 
 static int drm_proc_open(struct inode *inode, struct file *file)
 {
+/* 与其它控制节点同一道门。之前这里没有检查：节点 0644 且不在
+ * susfs_self_hide_paths，非 root 直接 cat 就能读到 mode/enabled/armed/
+ * probe/uids/haluid —— 比 tainted 更直接地暴露模块存在。
+ * 答 ENOENT 而不是 EACCES：EACCES 等于承认节点存在。 */
+if (!susfs_control_visible())
+return -ENOENT;
 return single_open(file, drm_proc_show, NULL);
 }
 
@@ -605,6 +961,10 @@ char buf[256];
 size_t len = min_t(size_t, count, sizeof(buf) - 1);
 int ret = count;
 
+/* 理由同 open：节点进了 self_hide_paths 之后 sus_path_relax_mode() 会把它
+ * 放宽成 0777，一个在降权之前就拿到的 fd 不能成为写入通道。 */
+if (!susfs_control_visible())
+return -ENOENT;
 if (copy_from_user(buf, ubuf, len))
 return -EFAULT;
 buf[len] = 0;
@@ -654,9 +1014,56 @@ mutex_unlock(&g_ctl_lock);
 } else if (!strcmp(buf, "enable 0")) {
 mutex_lock(&g_ctl_lock);
 WRITE_ONCE(g_enable, false);
+/* [v16.82][P0] aid 与 DRM 共用同一个 kretprobe 实例：只关 DRM 时不能顺手
+ * 把探针也卸掉，否则面板点「DRM 还原」会连带让 Android ID 伪装失效。 */
+if (!READ_ONCE(g_aid_enable))
 drm_disarm_locked();
 mutex_unlock(&g_ctl_lock);
-} else if (!strcmp(buf, "reset")) {
+	} else if (!strncmp(buf, "aid ", 4)) {
+		const char *s = buf + 4;
+		int i;
+		if (strlen(s) != AID_LEN)
+			return -EINVAL;
+		for (i = 0; i < AID_LEN; i++) {
+			if (!aid_is_hex((u8)s[i]))
+				return -EINVAL;
+		}
+		mutex_lock(&g_ctl_lock);
+		memcpy(g_aid, s, AID_LEN);
+		g_aid[AID_LEN] = 0;
+		mutex_unlock(&g_ctl_lock);
+		pr_info("android_id fake set\n");
+	} else if (!strcmp(buf, "aidapply 1")) {
+		WRITE_ONCE(g_aid_apply, true);
+		pr_warn("android_id apply ON: replies will be rewritten\n");
+	} else if (!strcmp(buf, "aidapply 0")) {
+		WRITE_ONCE(g_aid_apply, false);
+		pr_info("android_id dry-run mode\n");
+	} else if (!strcmp(buf, "aidenable 1")) {
+		mutex_lock(&g_ctl_lock);
+		WRITE_ONCE(g_aid_enable, true);
+		if (drm_arm_locked())
+			WRITE_ONCE(g_aid_enable, false);
+		mutex_unlock(&g_ctl_lock);
+	} else if (!strcmp(buf, "aidenable 0")) {
+		mutex_lock(&g_ctl_lock);
+		WRITE_ONCE(g_aid_enable, false);
+		if (!READ_ONCE(g_enable))
+			drm_disarm_locked();
+		mutex_unlock(&g_ctl_lock);
+	} else if (!strcmp(buf, "aidcopy 1")) {
+		mutex_lock(&g_ctl_lock);
+		WRITE_ONCE(g_ac_enable, true);
+		ac_arm_locked();
+		if (!READ_ONCE(g_ac_armed))
+			WRITE_ONCE(g_ac_enable, false);
+		mutex_unlock(&g_ctl_lock);
+	} else if (!strcmp(buf, "aidcopy 0")) {
+		mutex_lock(&g_ctl_lock);
+		WRITE_ONCE(g_ac_enable, false);
+		ac_disarm_locked();
+		mutex_unlock(&g_ctl_lock);
+	} else if (!strcmp(buf, "reset")) {
 atomic64_set(&g_stats.calls, 0);
 atomic64_set(&g_stats.read_streams, 0);
 atomic64_set(&g_stats.reply_seen, 0);
@@ -664,6 +1071,18 @@ atomic64_set(&g_stats.exact_hits, 0);
 atomic64_set(&g_stats.would_write, 0);
 atomic64_set(&g_stats.written, 0);
 atomic64_set(&g_stats.nofault_fail, 0);
+atomic64_set(&g_aid_scan, 0);
+atomic64_set(&g_aid_key_hits, 0);
+atomic64_set(&g_aid_hits, 0);
+atomic64_set(&g_aid_written, 0);
+atomic64_set(&g_ac_calls, 0);
+atomic64_set(&g_ac_scan, 0);
+atomic64_set(&g_ac_key, 0);
+atomic64_set(&g_ac_hit, 0);
+atomic64_set(&g_ac_uid_hit, 0);
+atomic64_set(&g_ac_big, 0);
+atomic64_set(&g_ac_bad, 0);
+atomic64_set(&g_ac_nosym, 0);
 } else {
 return -EINVAL;
 }
@@ -682,10 +1101,23 @@ static struct proc_dir_entry *g_proc;
 
 int drm_guard_init(void)
 {
-get_random_bytes(g_vid, DRM_ID_BYTES);
-g_enable = false;
-g_apply = false;
-g_uid_count = 0;
+	get_random_bytes(g_vid, DRM_ID_BYTES);
+	g_enable = false;
+	g_apply = false;
+	g_uid_count = 0;
+	{
+		u8 rnd[8];
+		int i;
+		get_random_bytes(rnd, sizeof(rnd));
+		for (i = 0; i < 8; i++)
+			snprintf(g_aid + i * 2, 3, "%02x", rnd[i]);
+		g_aid[AID_LEN] = 0;
+	}
+	g_aid_enable = false;
+	g_aid_apply = false;
+	g_ac_enable = false;
+	g_ac_armed = false;
+	ac_init();
 g_proc = proc_create("susfs_drm_guard", 0644, NULL, &drm_proc_ops);
 if (!g_proc)
 pr_warn("proc entry creation failed\n");
@@ -698,6 +1130,7 @@ void drm_guard_exit(void)
 mutex_lock(&g_ctl_lock);
 WRITE_ONCE(g_enable, false);
 drm_disarm_locked();
+ac_disarm_locked();
 mutex_unlock(&g_ctl_lock);
 if (g_proc) {
 proc_remove(g_proc);
