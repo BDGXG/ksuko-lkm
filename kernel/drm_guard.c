@@ -759,8 +759,8 @@ static size_t g_ssaid_off_f_path = (size_t)-1;
 static size_t g_ssaid_off_path_dentry = (size_t)-1;
 static size_t g_ssaid_off_dn_name = (size_t)-1;
 static size_t g_ssaid_off_qname = (size_t)-1;
-static atomic64_t g_ssaid_calls, g_ssaid_scan, g_ssaid_hit, g_ssaid_wr,
-		 g_ssaid_fail, g_ssaid_split;
+static atomic64_t g_ssaid_seen, g_ssaid_calls, g_ssaid_scan, g_ssaid_hit,
+		 g_ssaid_wr, g_ssaid_fail, g_ssaid_split;
 static const char ssaid_target[] = "settings_ssaid.xml";
 
 /* 只做「这个 file 是不是 settings_ssaid.xml」的判定：逐层从 BTF 解析出来的
@@ -793,6 +793,7 @@ static int __nocfi ssaid_entry_handler(struct kretprobe_instance *ri,
 	struct file *f;
 
 	rq->active = 0;
+	atomic64_inc(&g_ssaid_seen);
 	if (!READ_ONCE(g_ssaid_enable) || !READ_ONCE(g_ssaid_map_n))
 		return 0;
 	f = (struct file *)regs->regs[0];
@@ -948,25 +949,25 @@ static void ssaid_init(void)
 {
 	int rc;
 
-	rc = susfs_btf_member_offset("file", "f_path", "struct path",
+	rc = susfs_btf_member_offset("file", "f_path", "path",
 				     &g_ssaid_off_f_path);
 	if (rc) {
 		g_ssaid_off_f_path = (size_t)-1;
 		pr_warn("ssaid: file.f_path unresolved (%d)\n", rc);
 	}
-	rc = susfs_btf_member_offset("path", "dentry", "struct dentry *",
+	rc = susfs_btf_member_offset("path", "dentry", "dentry*",
 				     &g_ssaid_off_path_dentry);
 	if (rc) {
 		g_ssaid_off_path_dentry = (size_t)-1;
 		pr_warn("ssaid: path.dentry unresolved (%d)\n", rc);
 	}
-	rc = susfs_btf_member_offset("dentry", "d_name", "struct qstr",
+	rc = susfs_btf_member_offset("dentry", "d_name", "qstr",
 				     &g_ssaid_off_dn_name);
 	if (rc) {
 		g_ssaid_off_dn_name = (size_t)-1;
 		pr_warn("ssaid: dentry.d_name unresolved (%d)\n", rc);
 	}
-	rc = susfs_btf_member_offset("qstr", "name", "unsigned char *",
+	rc = susfs_btf_member_offset("qstr", "name", "unsigned char*",
 				     &g_ssaid_off_qname);
 	if (rc) {
 		g_ssaid_off_qname = (size_t)-1;
@@ -1542,12 +1543,15 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		atomic64_read(&g_aid_hits), atomic64_read(&g_aid_written));
 	seq_printf(m, "aidcopy_enable=%d ac_armed=%d\n",
 		READ_ONCE(g_ac_enable), READ_ONCE(g_ac_armed));
-	seq_printf(m, "ssaid enable=%d armed=%d n=%u calls=%lld scan=%lld hit=%lld wr=%lld fail=%lld split=%lld\n",
+	seq_printf(m, "ssaid enable=%d armed=%d n=%u vfs=%lld calls=%lld scan=%lld hit=%lld wr=%lld fail=%lld split=%lld\n",
 		   READ_ONCE(g_ssaid_enable), READ_ONCE(g_ssaid_armed),
-		   READ_ONCE(g_ssaid_map_n),
+		   READ_ONCE(g_ssaid_map_n), atomic64_read(&g_ssaid_seen),
 		   atomic64_read(&g_ssaid_calls), atomic64_read(&g_ssaid_scan),
 		   atomic64_read(&g_ssaid_hit), atomic64_read(&g_ssaid_wr),
 		   atomic64_read(&g_ssaid_fail), atomic64_read(&g_ssaid_split));
+	seq_printf(m, "ssaid off=%zd,%zd,%zd,%zd (/2d=unresolved)\n",
+		   g_ssaid_off_f_path, g_ssaid_off_path_dentry,
+		   g_ssaid_off_dn_name, g_ssaid_off_qname);
 	for (i = 0; i < READ_ONCE(g_ssaid_map_n) && i < SSAID_MAP_MAX; i++)
 		seq_printf(m, "  ssaid[%u]=%s %s\n", i, g_ssaid_map[i].pkg,
 			   g_ssaid_map[i].hex);
@@ -1802,6 +1806,7 @@ mutex_unlock(&g_ctl_lock);
 		ssaid_disarm_locked();
 		mutex_unlock(&g_ctl_lock);
 	} else if (!strcmp(buf, "ssaidreset")) {
+		atomic64_set(&g_ssaid_seen, 0);
 		atomic64_set(&g_ssaid_calls, 0);
 		atomic64_set(&g_ssaid_scan, 0);
 		atomic64_set(&g_ssaid_hit, 0);
