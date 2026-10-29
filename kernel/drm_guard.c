@@ -556,17 +556,29 @@ static int __nocfi ac_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
+static int (*ac_copy_to_fn)(void *alloc, void *buffer, unsigned long off,
+			    void *src, size_t bytes);
+static int (*ac_copy_from_fn)(void *alloc, void *dest, void *buffer,
+			      unsigned long off, size_t bytes);
+static int ac_arm_locked(void);
+static void ac_disarm_locked(void);
+#define SSAID_UID_MAX 8
+static u32 g_ssaid_uid[SSAID_UID_MAX];
+static char g_ssaid_uid_hex[SSAID_UID_MAX][AID_LEN + 1];
+static u32 g_ssaid_uid_n;
+static DEFINE_SPINLOCK(g_ssaid_uid_lock);
+static atomic64_t g_kb_written, g_kb_enc16, g_kb_seen;
+static bool g_ssaid_enable;
 struct kb_req {
 	void *alloc;
 	void *buffer;
 	u32 off;
 	u32 bytes;
+	u32 uid;
 };
-/* v7.6：binder_alloc_copy_from_buffer 是导出符号，用来从接收方 alloc 的
- * 内核 buffer 里回读刚由 copy_user_to_buffer 写进去的 payload。 */
-extern int binder_alloc_copy_from_buffer(void *alloc, void *dest,
-					 void *buffer, unsigned long buffer_offset,
-					 size_t bytes);
+/* v7.8：binder_alloc_copy_to/from_buffer 均未 EXPORT_SYMBOL，
+ * 不能 extern 声明直接调用（加载会 unknown symbol），
+ * 改用 ac_copy_to_fn / ac_copy_from_fn 函数指针（ac_init 里 kallsyms 解析）。 */
 static struct kretprobe g_kb_rp;
 static atomic64_t g_kb_calls, g_kb_scan, g_kb_hit;
 static atomic64_t g_kb_off;
@@ -625,7 +637,7 @@ static bool __maybe_unused __nocfi noinline kb_find_aid(const u8 *b, u32 bytes, 
 	}
 	return false;
 }
-static int __nocfi kb_entry_handler(struct kretprobe_instance *ri,
+static int __nocfi __maybe_unused kb_entry_handler(struct kretprobe_instance *ri,
 				    struct pt_regs *regs)
 {
 	struct kb_req *rq = (struct kb_req *)ri->data;
@@ -662,43 +674,78 @@ static int __nocfi kb_entry_handler(struct kretprobe_instance *ri,
 	rq->buffer = buffer;
 	rq->off = (u32)off;
 	rq->bytes = (u32)bytes;
+	rq->uid = ruid;
 	return 1;
+}
+static u32 __nocfi __maybe_unused noinline kb_patch_all(void *alloc, void *buffer, u32 base_off,
+					 const u8 *b, u32 bytes,
+					 const char *hex, bool apply, u32 *seen)
+{
+	u32 q = 0, i, last, hits = 0;
+
+	if (bytes < 4 + AID_LEN * 2)
+		return 0;
+	last = bytes - 4 - AID_LEN * 2;
+	while (q <= last) {
+		const u8 *p = memchr(b + q, (int)(u8)AID_LEN,
+				     (size_t)(last - q + 1));
+		u32 pos;
+
+		if (!p)
+			break;
+		q = (u32)(p - b);
+		if (p[1] || p[2] || p[3]) {
+			q++;
+			continue;
+		}
+		pos = q + 4;
+		for (i = 0; i < AID_LEN; i++)
+			if (b[pos + i * 2 + 1] || !aid_is_hex(b[pos + i * 2]))
+				break;
+		if (i == AID_LEN) {
+			u32 t = pos + AID_LEN * 2;
+
+			if (!(t + 1 < bytes && b[t + 1] == 0 && aid_is_hex(b[t]))) {
+				(*seen)++;
+				if (apply && hex && ac_copy_to_fn) {
+					u8 out[AID_LEN * 2];
+
+					for (i = 0; i < AID_LEN; i++) {
+						out[i * 2] = (u8)hex[i];
+						out[i * 2 + 1] = 0;
+					}
+					if (!ac_copy_to_fn(alloc, buffer,
+							(unsigned long)(base_off + pos),
+							out, AID_LEN * 2))
+						hits++;
+					atomic64_inc(&g_kb_enc16);
+				}
+			}
+			q = t;
+			continue;
+		}
+		for (i = 0; i < AID_LEN; i++)
+			if (!aid_is_hex(b[pos + i]))
+				break;
+		if (i == AID_LEN && pos + AID_LEN < bytes &&
+		    !aid_is_hex(b[pos + AID_LEN])) {
+			(*seen)++;
+			if (apply && hex && ac_copy_to_fn &&
+			    !ac_copy_to_fn(alloc, buffer,
+					   (unsigned long)(base_off + pos),
+					   (void *)hex, AID_LEN))
+				hits++;
+		}
+		q++;
+	}
+	return hits;
 }
 static int __nocfi kb_ret_handler(struct kretprobe_instance *ri,
 				  struct pt_regs *regs)
 {
-	struct kb_req *rq = (struct kb_req *)ri->data;
-	u32 bytes = rq->bytes, off = 0, n;
-	u8 tmp[KB_READ_BYTES];
-	int bk, rc;
+	/* v7.9：本探针已不再注册（见 ac_arm_locked），保留空壳仅为符号占位。 */
+	(void)ri;
 	(void)regs;
-	if (!rq->buffer || !bytes)
-		return 0;
-	if (READ_ONCE(g_kb_stop))
-		return 0;
-	atomic64_inc(&g_kb_scan);
-	atomic64_add(bytes, &g_kb_bytesum);
-	bk = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : 3;
-	atomic64_inc(&g_kb_sz[bk]);
-	if (bytes < 4 + AID_LEN * 2 || bytes > KB_READ_BYTES)
-		return 0;
-	if (atomic64_inc_return(&g_kb_rd) > KB_READ_CAP)
-		return 0;
-	n = bytes < KB_READ_BYTES ? bytes : KB_READ_BYTES;
-	/* v7.6：数据刚刚写进接收方 alloc 的 buffer，用回读接口取出来扫 */
-	rc = binder_alloc_copy_from_buffer(rq->alloc, tmp, rq->buffer,
-					   (unsigned long)rq->off, (size_t)n);
-	if (rc) {
-		atomic64_inc(&g_kb_bad);
-		return 0;
-	}
-	if (!kb_find_aid(tmp, n, &off))
-		return 0;
-	atomic64_inc(&g_kb_hit);
-	WRITE_ONCE(g_kb_stop, true);	/* 抓到就停 */
-	atomic64_set(&g_kb_off, off);
-	memcpy(g_ac_dump, tmp, n);
-	WRITE_ONCE(g_ac_dump_len, n);
 	return 0;
 }
 /* =====================================================================
@@ -751,16 +798,32 @@ static struct ssaid_ent g_ssaid_map[SSAID_MAP_MAX];
 static u32 g_ssaid_map_n;
 static DEFINE_SPINLOCK(g_ssaid_map_lock);
 static DEFINE_SPINLOCK(g_ssaid_work_lock);
-static bool g_ssaid_enable;
 static bool g_ssaid_armed;
+/* 2026-10-29: the binder_alloc kprobe+kretprobe pair took the device down on its
+ * first real run (soft reboot ~2 min after arming) while every other layer of
+ * this ko was healthy. Arming is now opt-in via insmod ssaid_probe=1 so one ko
+ * can validate the rest of the module before this path is switched back on. */
+static bool g_ssaid_probe_allow;
+module_param_named(ssaid_probe, g_ssaid_probe_allow, bool, 0644);
 static u8 g_ssaid_buf[SSAID_SCAN];
+/* v7.9：ssaid 恢复独立 kretprobe，挂 vfs_read（FileInputStream.read 的真落点）。
+ * 绝不借用 ac 的 binder_alloc 探针对：kb_ret_handler 在 kretprobe 返回点再调
+ * binder_alloc_copy_from/to_buffer 等于重取 alloc->mutex，2026-10-29 的软重启
+ * 就是这条路径造成的。 */
 static struct kretprobe g_ssaid_rp;
+static const char *const ssaid_probe_syms[] = {
+	"vfs_read", "kernel_read", "ksys_read", NULL
+};
 static size_t g_ssaid_off_f_path = (size_t)-1;
 static size_t g_ssaid_off_path_dentry = (size_t)-1;
 static size_t g_ssaid_off_dn_name = (size_t)-1;
 static size_t g_ssaid_off_qname = (size_t)-1;
 static atomic64_t g_ssaid_seen, g_ssaid_calls, g_ssaid_scan, g_ssaid_hit,
 		 g_ssaid_wr, g_ssaid_fail, g_ssaid_split;
+static atomic64_t g_ssaid_dbg_target, g_ssaid_dbg_uid1000;
+/* v79d 调试：抓一次 dentry name 原始内容，验证偏移链语义是否正确 */
+static char g_ssaid_dbg_buf[32];
+static int g_ssaid_dbg_have;
 static const char ssaid_target[] = "settings_ssaid.xml";
 
 /* 只做「这个 file 是不是 settings_ssaid.xml」的判定：逐层从 BTF 解析出来的
@@ -783,6 +846,12 @@ static bool __nocfi noinline ssaid_is_target(struct file *f)
 	       sizeof(name));
 	if (!name)
 		return false;
+	if (!READ_ONCE(g_ssaid_dbg_have)) {
+		if (!copy_from_kernel_nofault(g_ssaid_dbg_buf, name, 24)) {
+			g_ssaid_dbg_buf[24] = 0;
+			WRITE_ONCE(g_ssaid_dbg_have, 1);
+		}
+	}
 	return !memcmp(name, ssaid_target, sizeof(ssaid_target));
 }
 
@@ -794,14 +863,20 @@ static int __nocfi ssaid_entry_handler(struct kretprobe_instance *ri,
 
 	rq->active = 0;
 	atomic64_inc(&g_ssaid_seen);
-	if (!READ_ONCE(g_ssaid_enable) || !READ_ONCE(g_ssaid_map_n))
+	if (!READ_ONCE(g_ssaid_enable) || (!READ_ONCE(g_ssaid_map_n) && !READ_ONCE(g_ssaid_uid_n)))
 		return 0;
 	f = (struct file *)regs->regs[0];
-	if (!f || !ssaid_is_target(f))
+	if (!f)
 		return 0;
-	/* 只有 system_server(uid 1000) 会读这份文件，其余一律不碰。 */
-	if (__kuid_val(current_uid()) != 1000)
-		return 0;
+	{
+		bool t = ssaid_is_target(f);
+		if (t)
+			atomic64_inc(&g_ssaid_dbg_target);
+		if (__kuid_val(current_uid()) == 1000)
+			atomic64_inc(&g_ssaid_dbg_uid1000);
+		if (!t || __kuid_val(current_uid()) != 1000)
+			return 0;
+	}
 	atomic64_inc(&g_ssaid_calls);
 	rq->buf = (const char __user *)regs->regs[1];
 	rq->count = (size_t)regs->regs[2];
@@ -832,47 +907,132 @@ static u32 __nocfi noinline ssaid_copy_in(const char __user *from, u32 bytes)
 }
 
 /* 在已拷到 g_ssaid_buf 的 chunk 里找 pkg，命中就原地改两处 16 字节 hex。
- * 返回成功写入的处数（0 表示没找到 / 校验不过 / 跨块跳过）。
+ * 返回成功写入的处数；*matched 置 1 表示记录命中（即使值已等于目标）。
  * 调用者必须已持有 g_ssaid_work_lock 且 g_ssaid_buf 里是本 chunk 的内容。 */
 static u32 ssaid_patch_chunk(const char __user *ubuf, u32 n, const char *pkg,
-			     const char *hex)
+     const char *hex, int *matched)
 {
-	u32 plen = strlen(pkg), i;
-	u32 w = 0;
+u32 plen = strlen(pkg), i;
+u32 w = 0;
 
-	for (i = 0; i + plen + 2 < n; i++) {
-		int voff, doff;
+for (i = 0; i + plen + 2 < n; i++) {
+int voff, doff;
 
-		/* 记录里包名前固定是 \x00 <len> */
-		if (g_ssaid_buf[i] != 0 || (u8)g_ssaid_buf[i + 1] != plen)
-			continue;
-		if (memcmp(g_ssaid_buf + i + 2, pkg, plen))
-			continue;
-		voff = (int)(i + 2) - 21;
-		doff = (int)(i + 2) + (int)plen + 5;
-		if (voff < 2 || doff + AID_LEN + 2 > (int)n) {
-			atomic64_inc(&g_ssaid_split);
-			continue;
-		}
-		/* 两处 hex 前面都必须是 \x00 \x10（len=16） */
-		if (g_ssaid_buf[voff - 2] != 0 || g_ssaid_buf[voff - 1] != AID_LEN ||
-		    g_ssaid_buf[doff - 2] != 0 || g_ssaid_buf[doff - 1] != AID_LEN)
-			continue;
-		if (memcmp(g_ssaid_buf + voff, hex, AID_LEN)) {
-			if (!copy_to_user_nofault((char __user *)ubuf + voff, hex,
-						  AID_LEN))
-				w++;
-		}
-		if (memcmp(g_ssaid_buf + doff, hex, AID_LEN)) {
-			if (!copy_to_user_nofault((char __user *)ubuf + doff, hex,
-						  AID_LEN))
-				w++;
-		}
-		memcpy(g_ssaid_buf + voff, hex, AID_LEN);
-		memcpy(g_ssaid_buf + doff, hex, AID_LEN);
-		return w;
-	}
-	return 0;
+/* 记录里包名前固定是 \x00 <len> */
+if (g_ssaid_buf[i] != 0 || (u8)g_ssaid_buf[i + 1] != plen)
+continue;
+if (memcmp(g_ssaid_buf + i + 2, pkg, plen))
+continue;
+voff = (int)(i + 2) - 21;
+doff = (int)(i + 2) + (int)plen + 5;
+if (voff < 2 || doff + AID_LEN + 2 > (int)n) {
+atomic64_inc(&g_ssaid_split);
+continue;
+}
+/* 两处 hex 前面都必须是 \x00 \x10（len=16） */
+if (g_ssaid_buf[voff - 2] != 0 || g_ssaid_buf[voff - 1] != AID_LEN ||
+    g_ssaid_buf[doff - 2] != 0 || g_ssaid_buf[doff - 1] != AID_LEN)
+continue;
+if (matched)
+*matched = 1;
+if (memcmp(g_ssaid_buf + voff, hex, AID_LEN)) {
+if (!copy_to_user_nofault((char __user *)ubuf + voff, hex,
+  AID_LEN))
+w++;
+}
+if (memcmp(g_ssaid_buf + doff, hex, AID_LEN)) {
+if (!copy_to_user_nofault((char __user *)ubuf + doff, hex,
+  AID_LEN))
+w++;
+}
+memcpy(g_ssaid_buf + voff, hex, AID_LEN);
+memcpy(g_ssaid_buf + doff, hex, AID_LEN);
+return w;
+}
+return 0;
+}
+
+/* [v79e] 按 userkey(=uid) 定位记录再改 value/defaultValue。
+ * 真实 ABX 布局（2026-10-29 从 settings_ssaid.xml 逐字节确认）：
+ *   2f 00 04 00 <len> "<uid 十进制>"   <- userkey，如 2f 00 04 00 05 31 30 34 32 30
+ *   2f 00 05 00 10 <16 hex>           <- value
+ *   2f 00 06 00 <len> "<pkg>"         <- package
+ *   2f 00 07 00 10 <16 hex>           <- defaultValue
+ * 只吃 userkey 的好处：多开/二空间同包名各有独立 uid，不会互相误伤。
+ */
+static u32 ssaid_patch_uid_chunk(const char __user *ubuf, u32 n, u32 uid,
+ const char *hex, int *matched)
+{
+char key[16];
+u8 needle[24];
+u32 klen, nlen, i, w = 0;
+
+klen = (u32)snprintf(key, sizeof(key), "%u", uid);
+if (klen == 0 || klen + 5 > (u32)sizeof(needle))
+return 0;
+needle[0] = 0x2f;
+needle[1] = 0x00;
+needle[2] = 0x04;
+needle[3] = 0x00;
+needle[4] = (u8)klen;
+memcpy(needle + 5, key, klen);
+nlen = 5 + klen;
+
+for (i = 0; i + nlen + 1 < n; i++) {
+int voff = -1, doff = -1;
+u32 j, lim;
+
+if (memcmp(g_ssaid_buf + i, needle, nlen))
+continue;
+/* 紧跟下一字段头 0x2f，避免 "10420" 命中 "104201" */
+if (g_ssaid_buf[i + nlen] != 0x2f)
+continue;
+lim = i + 256;
+if (lim > n - 5)
+lim = n - 5;
+if (lim <= i + nlen)
+continue;
+/* value 字段：2f 00 05 00 10 */
+for (j = i + nlen; j <= lim; j++) {
+if (g_ssaid_buf[j] == 0x2f && g_ssaid_buf[j + 1] == 0x00 &&
+    g_ssaid_buf[j + 2] == 0x05 && g_ssaid_buf[j + 3] == 0x00 &&
+    g_ssaid_buf[j + 4] == AID_LEN) {
+voff = (int)j + 5;
+break;
+}
+}
+if (voff < 0 || (u32)voff + AID_LEN > n)
+continue;
+/* defaultValue 字段：2f 00 07 00 10（找不到就只改 value） */
+for (j = (u32)voff; j <= lim; j++) {
+if (g_ssaid_buf[j] == 0x2f && g_ssaid_buf[j + 1] == 0x00 &&
+    g_ssaid_buf[j + 2] == 0x07 && g_ssaid_buf[j + 3] == 0x00 &&
+    g_ssaid_buf[j + 4] == AID_LEN) {
+doff = (int)j + 5;
+break;
+}
+}
+if (doff >= 0 && (u32)doff + AID_LEN > n)
+doff = -1;
+if (matched)
+*matched = 1;
+if (memcmp(g_ssaid_buf + voff, hex, AID_LEN)) {
+if (!copy_to_user_nofault((char __user *)ubuf + voff, hex,
+  AID_LEN))
+w++;
+}
+memcpy(g_ssaid_buf + voff, hex, AID_LEN);
+if (doff >= 0) {
+if (memcmp(g_ssaid_buf + doff, hex, AID_LEN)) {
+if (!copy_to_user_nofault((char __user *)ubuf + doff,
+  hex, AID_LEN))
+w++;
+}
+memcpy(g_ssaid_buf + doff, hex, AID_LEN);
+}
+return w;
+}
+return 0;
 }
 
 static int __nocfi ssaid_ret_handler(struct kretprobe_instance *ri,
@@ -898,13 +1058,23 @@ static int __nocfi ssaid_ret_handler(struct kretprobe_instance *ri,
 	}
 	atomic64_inc(&g_ssaid_scan);
 	for (i = 0; i < READ_ONCE(g_ssaid_map_n) && i < SSAID_MAP_MAX; i++) {
+		int m = 0;
 		u32 r = ssaid_patch_chunk(rq->buf, n, g_ssaid_map[i].pkg,
-					  g_ssaid_map[i].hex);
+					  g_ssaid_map[i].hex, &m);
 
-		if (r) {
+		if (m)
 			atomic64_inc(&g_ssaid_hit);
-			w += r;
-		}
+		w += r;
+	}
+	/* [v79e] userkey(uid) 链：与包名链并存，多开/二空间按 uid 精确命中 */
+	for (i = 0; i < READ_ONCE(g_ssaid_uid_n) && i < SSAID_UID_MAX; i++) {
+		int m = 0;
+		u32 r = ssaid_patch_uid_chunk(rq->buf, n, g_ssaid_uid[i],
+					      g_ssaid_uid_hex[i], &m);
+
+		if (m)
+			atomic64_inc(&g_ssaid_hit);
+		w += r;
 	}
 	if (w)
 		atomic64_add(w, &g_ssaid_wr);
@@ -914,24 +1084,30 @@ static int __nocfi ssaid_ret_handler(struct kretprobe_instance *ri,
 
 static int ssaid_arm_locked(void)
 {
-	int ret;
+	int ret = -ENOENT, i;
 
 	if (g_ssaid_armed)
 		return 0;
 	memset(&g_ssaid_rp, 0, sizeof(g_ssaid_rp));
-	g_ssaid_rp.kp.symbol_name = "vfs_read";
 	g_ssaid_rp.entry_handler = ssaid_entry_handler;
 	g_ssaid_rp.handler = ssaid_ret_handler;
 	g_ssaid_rp.data_size = sizeof(struct ssaid_req);
 	g_ssaid_rp.maxactive = 64;
-	ret = register_kretprobe(&g_ssaid_rp);
+	for (i = 0; ssaid_probe_syms[i]; i++) {
+		g_ssaid_rp.kp.symbol_name = ssaid_probe_syms[i];
+		g_ssaid_rp.kp.addr = NULL;
+		ret = register_kretprobe(&g_ssaid_rp);
+		if (!ret)
+			break;
+	}
 	if (ret) {
+		pr_warn("ssaid: arm failed on vfs_read family: %d\n", ret);
 		g_ssaid_rp.kp.symbol_name = NULL;
-		pr_warn("ssaid: probe on vfs_read failed: %d\n", ret);
 		return ret;
 	}
 	g_ssaid_armed = true;
-	pr_info("ssaid probe armed on vfs_read\n");
+	pr_info("ssaid: armed on %s (uid-keyed read patch)\n",
+		ssaid_probe_syms[i]);
 	return 0;
 }
 
@@ -940,9 +1116,10 @@ static void ssaid_disarm_locked(void)
 	if (!g_ssaid_armed)
 		return;
 	unregister_kretprobe(&g_ssaid_rp);
+	g_ssaid_rp.kp.addr = NULL;
 	g_ssaid_rp.kp.symbol_name = NULL;
 	g_ssaid_armed = false;
-	pr_info("ssaid probe disarmed\n");
+	pr_info("ssaid: disarmed\n");
 }
 
 static void ssaid_init(void)
@@ -995,36 +1172,10 @@ static int ac_arm_locked(void)
 	}
 	g_ac_armed = true;
 	pr_info("aidcopy probe armed on %s\n", g_ac_kp.symbol_name);
-	/* v7：reply 方向改读内核侧 binder buffer —— binder_alloc_copy_from_buffer
-	 * (alloc, dest, buffer_off, bytes) 的 dest 是内核缓冲，返回点直接扫，
-	 * 不受 mm 属主与缺页影响；归属用 current（这时正是收 reply 的进程）。 */
-	memset(&g_kb_rp, 0, sizeof(g_kb_rp));
-	WRITE_ONCE(g_kb_stop, false);
-	atomic64_set(&g_kb_calls, 0);
-	atomic64_set(&g_kb_scan, 0);
-	atomic64_set(&g_kb_hit, 0);
-	atomic64_set(&g_kb_off, 0);
-	atomic64_set(&g_kb_big, 0);
-	atomic64_set(&g_kb_nouid, 0);
-	memset(g_kb_sz, 0, sizeof(g_kb_sz));
-	atomic64_set(&g_kb_bytesum, 0);
-	atomic64_set(&g_kb_bad, 0);
-	atomic64_set(&g_kb_rd, 0);
-	g_kb_rp.kp.symbol_name = "binder_alloc_copy_user_to_buffer";
-	g_kb_rp.entry_handler = kb_entry_handler;
-	g_kb_rp.handler = kb_ret_handler;
-	g_kb_rp.data_size = sizeof(struct kb_req);
-	g_kb_rp.maxactive = 32;
-	ret = register_kretprobe(&g_kb_rp);
-	if (ret) {
-		g_kb_rp.kp.addr = NULL;
-		atomic64_inc(&g_ac_nosym);
-		pr_warn("aidcopy: kb probe failed on %s: %d\n",
-			g_kb_rp.kp.symbol_name, ret);
-	} else {
-		pr_info("aidcopy: kb probe armed on %s\n",
-			g_kb_rp.kp.symbol_name);
-	}
+	/* v7.9：kb（binder_alloc 收包）段已彻底停用。该探针对在 kretprobe 返回点
+	 * 再取 alloc->mutex（binder_alloc_copy_from_buffer），2026-10-29 实测 arm
+	 * 后约 2 分钟软重启；从这里移除注册，kb_ret_handler 只留空壳占位。
+	 * ac 只管 aidcopy 的 pre_handler 直读用户缓冲，与 ssaid 彻底解耦。 */
 	return 0;
 }
 
@@ -1064,6 +1215,13 @@ static void ac_init(void)
 	}
 	ac_find_task_fn = (void *)ksu_kallsyms_lookup_name("find_get_task_by_vpid");
 	ac_task_cred_fn = (void *)ksu_kallsyms_lookup_name("get_task_cred");
+	ac_copy_to_fn = (void *)ksu_kallsyms_lookup_name("binder_alloc_copy_to_buffer");
+	ac_copy_from_fn = (void *)ksu_kallsyms_lookup_name("binder_alloc_copy_from_buffer");
+	if (!ac_copy_to_fn || !ac_copy_from_fn) {
+		atomic64_inc(&g_ac_nosym);
+		pr_warn("aidcopy: copy resolver missing to=%d from=%d\n",
+			!!ac_copy_to_fn, !!ac_copy_from_fn);
+	}
 	if (!ac_find_task_fn || !ac_task_cred_fn) {
 		atomic64_inc(&g_ac_nosym);
 		pr_warn("aidcopy: uid resolver missing\n");
@@ -1549,9 +1707,15 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		   atomic64_read(&g_ssaid_calls), atomic64_read(&g_ssaid_scan),
 		   atomic64_read(&g_ssaid_hit), atomic64_read(&g_ssaid_wr),
 		   atomic64_read(&g_ssaid_fail), atomic64_read(&g_ssaid_split));
-	seq_printf(m, "ssaid off=%zd,%zd,%zd,%zd (/2d=unresolved)\n",
+	seq_printf(m, "ssaid off=%zd,%zd,%zd,%zd (/2d=%s)\n",
 		   g_ssaid_off_f_path, g_ssaid_off_path_dentry,
-		   g_ssaid_off_dn_name, g_ssaid_off_qname);
+		   g_ssaid_off_dn_name, g_ssaid_off_qname,
+		   g_ssaid_off_qname == (size_t)-1 ? "unresolved" : "ok");
+	seq_printf(m, "ssaid dbg target=%lld uid1000=%lld\n",
+		   atomic64_read(&g_ssaid_dbg_target),
+		   atomic64_read(&g_ssaid_dbg_uid1000));
+	seq_printf(m, "ssaid dbg name=%s\n",
+		   READ_ONCE(g_ssaid_dbg_have) ? g_ssaid_dbg_buf : "(none)");
 	for (i = 0; i < READ_ONCE(g_ssaid_map_n) && i < SSAID_MAP_MAX; i++)
 		seq_printf(m, "  ssaid[%u]=%s %s\n", i, g_ssaid_map[i].pkg,
 			   g_ssaid_map[i].hex);
@@ -1577,8 +1741,15 @@ seq_printf(m, "why cmd=%lld ret=%lld arg=%lld bwr=%lld noread=%lld\n",
 		READ_ONCE(g_kb_stop) ? 1 : 0,
 		atomic64_read(&g_kb_big), atomic64_read(&g_kb_nouid),
 		KB_SCAN_CAP, KB_MAX_BYTES);
-	seq_printf(m, "kb rd=%lld bad=%lld\n",
-		atomic64_read(&g_kb_rd), atomic64_read(&g_kb_bad));
+	seq_printf(m, "kb rd=%lld bad=%lld wr=%lld enc16=%lld seen=%lld\n",
+		atomic64_read(&g_kb_rd), atomic64_read(&g_kb_bad),
+		atomic64_read(&g_kb_written), atomic64_read(&g_kb_enc16),
+		atomic64_read(&g_kb_seen));
+	seq_printf(m, "ssaid_uid n=%u armed=%d\n",
+		READ_ONCE(g_ssaid_uid_n), READ_ONCE(g_ssaid_armed));
+	for (i = 0; i < READ_ONCE(g_ssaid_uid_n) && i < SSAID_UID_MAX; i++)
+		seq_printf(m, "  ssaid_uid[%u]=%u %s\n", i, g_ssaid_uid[i],
+			   g_ssaid_uid_hex[i]);
 	seq_printf(m, "kb sz 64=%lld 256=%lld 1k=%lld 4k=%lld sum=%lld v=%d\n",
 		atomic64_read(&g_kb_sz[0]), atomic64_read(&g_kb_sz[1]),
 		atomic64_read(&g_kb_sz[2]), atomic64_read(&g_kb_sz[3]),
@@ -1786,6 +1957,55 @@ mutex_unlock(&g_ctl_lock);
 		spin_unlock(&g_ssaid_map_lock);
 		mutex_unlock(&g_ctl_lock);
 		pr_info("ssaid map: %s -> %s\n", pkg, p);
+		} else if (!strncmp(buf, "ssaiduid ", 9)) {
+		char *p = buf + 9, *q;
+		char hx[AID_LEN + 1];
+		u32 uid, i, n;
+
+		q = strchr(p, ' ');
+		if (!q)
+			return -EINVAL;
+		*q = '\0';
+		if (kstrtou32(p, 10, &uid))
+			return -EINVAL;
+		q++;
+		if (strlen(q) != AID_LEN)
+			return -EINVAL;
+		for (i = 0; i < AID_LEN; i++)
+			if (!aid_is_hex((u8)q[i]))
+				return -EINVAL;
+		memcpy(hx, q, AID_LEN);
+		hx[AID_LEN] = 0;
+		mutex_lock(&g_ctl_lock);
+		spin_lock(&g_ssaid_uid_lock);
+		n = READ_ONCE(g_ssaid_uid_n);
+		for (i = 0; i < n; i++)
+			if (g_ssaid_uid[i] == uid)
+				break;
+		if (i == n && n < SSAID_UID_MAX) {
+			g_ssaid_uid[n] = uid;
+			WRITE_ONCE(g_ssaid_uid_n, n + 1);
+			n++;
+		} else if (i == n) {
+			/* [v16.115] 表满不再静默丢弃：显式告警，便于排查「写了却没生效」 */
+			pr_warn("ssaid uid map FULL (%u/%u), drop uid %u\n",
+				n, SSAID_UID_MAX, uid);
+		}
+		if (i < n) {
+			memcpy(g_ssaid_uid_hex[i], hx, AID_LEN + 1);
+			pr_info("ssaid uid map: %u -> %s\n", uid, hx);
+		}
+		spin_unlock(&g_ssaid_uid_lock);
+		mutex_unlock(&g_ctl_lock);
+	} else if (!strcmp(buf, "ssaiduidclear")) {
+		mutex_lock(&g_ctl_lock);
+		spin_lock(&g_ssaid_uid_lock);
+		memset(g_ssaid_uid, 0, sizeof(g_ssaid_uid));
+		memset(g_ssaid_uid_hex, 0, sizeof(g_ssaid_uid_hex));
+		WRITE_ONCE(g_ssaid_uid_n, 0);
+		spin_unlock(&g_ssaid_uid_lock);
+		mutex_unlock(&g_ctl_lock);
+		pr_info("ssaid uid map cleared\n");
 	} else if (!strcmp(buf, "ssaidmapclear")) {
 		mutex_lock(&g_ctl_lock);
 		spin_lock(&g_ssaid_map_lock);
@@ -1795,6 +2015,10 @@ mutex_unlock(&g_ctl_lock);
 		mutex_unlock(&g_ctl_lock);
 		pr_info("ssaid map cleared\n");
 	} else if (!strcmp(buf, "ssaidenable 1")) {
+		if (!READ_ONCE(g_ssaid_probe_allow)) {
+			pr_info("ssaid: arm refused, insmod ssaid_probe=1 not set\n");
+			return -EPERM;
+		}
 		mutex_lock(&g_ctl_lock);
 		WRITE_ONCE(g_ssaid_enable, true);
 		if (ssaid_arm_locked())
@@ -1837,6 +2061,9 @@ atomic64_set(&g_ac_nosym, 0);
 atomic64_set(&g_ac_dst_scan, 0);
 atomic64_set(&g_ac_dst_hit, 0);
 atomic64_set(&g_ac_dst_seen, 0);
+atomic64_set(&g_kb_written, 0);
+atomic64_set(&g_kb_enc16, 0);
+atomic64_set(&g_kb_seen, 0);
 atomic64_set(&g_kb_calls, 0);
 atomic64_set(&g_kb_scan, 0);
 atomic64_set(&g_kb_hit, 0);

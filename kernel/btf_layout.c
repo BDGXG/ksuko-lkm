@@ -128,9 +128,20 @@ static bool susfs_btf_matches(u32 id, const char *wanted)
             id = t->type;
             continue;
         }
+        if (!strcmp(base, "char") || !strcmp(base, "unsigned char") ||
+            !strcmp(base, "s8") || !strcmp(base, "u8")) {
+            u32 encoding;
+            bool want_signed = !strcmp(base, "char") || !strcmp(base, "s8");
+            if (kind != BTF_KIND_INT || t->size != 1)
+                return false;
+            encoding = *(const u32 *)(t + 1);
+            return BTF_INT_BITS(encoding) == 8 &&
+                   BTF_INT_OFFSET(encoding) == 0 &&
+                   !!(BTF_INT_ENCODING(encoding) & BTF_INT_SIGNED) ==
+                       want_signed;
+        }
         if (!strcmp(base, "int") || !strcmp(base, "uint")) {
             u32 encoding;
-
             if (kind != BTF_KIND_INT || t->size != sizeof(u32))
                 return false;
             encoding = *(const u32 *)(t + 1);
@@ -139,8 +150,6 @@ static bool susfs_btf_matches(u32 id, const char *wanted)
                    !!(BTF_INT_ENCODING(encoding) & BTF_INT_SIGNED) ==
                        !strcmp(base, "int");
         }
-        if (kind == BTF_KIND_INT)
-            return name && !strcmp(name, base);
         return kind == BTF_KIND_STRUCT && name && !strcmp(name, base);
     }
     return false;
