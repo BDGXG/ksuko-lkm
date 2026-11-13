@@ -76,6 +76,7 @@ static u32 g_ring_head;
 static struct ag_ent g_ret_ring[64];
 static u32 g_ret_head;
 static atomic64_t g_n_rets;
+static atomic64_t g_n_calls, g_n_skips;
 
 /* ---- uprobe consumers ---- */
 static int ag_handler(struct uprobe_consumer *self, struct pt_regs *regs)
