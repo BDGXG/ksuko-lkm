@@ -12,6 +12,7 @@ on:
       - hg-kernel
     paths:
       - "kernel/**"
+      - ".github/workflows/build-66.yml"
   # Pull requests build the same way, which is what a fork contribution needs: the first fork PR this
   # repository took arrived with a header comment that broke every variant, and nothing here could
   # see it until the branch had been pulled in by hand.  This is safe to enable because GitHub runs the
@@ -189,8 +190,8 @@ jobs:
           # run `make -C $KDIR M=.../kernel` with no ARCH/CC/LLVM and no `modules` target, silently depending on the image's
           # exported ARCH/LLVM.  -k (keep going) so one broken object does not hide every later one; it still exits nonzero.
           make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
-          ls -la kernel/susfs_guard_lkm.ko
-          file kernel/susfs_guard_lkm.ko
+          ls -la kernel/susfs_guard_lkm.ko kernel/anti_data_gate_lkm.ko
+          file kernel/susfs_guard_lkm.ko kernel/anti_data_gate_lkm.ko
 
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
@@ -594,6 +595,13 @@ jobs:
         with:
           name: susfs_guard_lkm.ko-${{ matrix.variant }}
           path: kernel/susfs_guard_lkm.ko
+          if-no-files-found: error
+
+      - name: Upload anti_data_gate_lkm.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: anti_data_gate_lkm.ko-${{ matrix.variant }}
+          path: kernel/anti_data_gate_lkm.ko
           if-no-files-found: error
 
   # The userspace tools are freestanding and kernel-independent, so they are built once rather than eight times.  A broken
