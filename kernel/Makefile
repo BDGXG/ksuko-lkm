@@ -67,3 +67,9 @@ endif
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# ---- anti_data_gate 独立模块（与 susfs_guard_lkm 并存，不覆盖 211 原版）----
+# anti_data_gate.c 完全自包含（只用内核 uprobe/proc 接口，不依赖 susfs 私有符号），
+# 单独编译为 anti_data_gate_lkm.ko，可 insmod 到已运行 211 原版的设备上。
+obj-m += anti_data_gate_lkm.o
+anti_data_gate_lkm-objs := anti_data_gate_solo.o
