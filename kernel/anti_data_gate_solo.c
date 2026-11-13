@@ -72,12 +72,11 @@ struct ag_ent {
 };
 static struct ag_ent g_ring[AG_RING_N];
 static u32 g_ring_head;
-static struct ag_ent g_ret_ring[64];
-static u32 g_ret_head;
-static atomic64_t g_n_rets;
 static atomic64_t g_n_calls, g_n_skips;
 
-/* ---- uprobe consumers ---- */
+/* ---- uprobe consumers ----
+ * v3: 砍掉 uretprobe (返回值记录纯属多余, 蹦床劫持返回地址是最大死机面).
+ * 只保留 entry probe: 改 regs->regs[1] + ring 记录, 全部在 XOL 前完成. */
 static int ag_handler(struct uprobe_consumer *self, struct pt_regs *regs)
 {
     struct ag_ent *e;
@@ -118,42 +117,18 @@ static int ag_handler(struct uprobe_consumer *self, struct pt_regs *regs)
     return 0;
 }
 
-static int ag_ret_handler(struct uprobe_consumer *self, unsigned long func,
-                          struct pt_regs *regs)
-{
-    struct ag_ent *e;
-    u32 uid = __kuid_val(current_uid());
-    u32 i, n, head;
-
-    if (!READ_ONCE(g_enable))
-        return 0;
-    n = READ_ONCE(g_uid_count);
-    if (n) {
-        bool hit = false;
-        for (i = 0; i < n && i < AG_UID_N; i++)
-            if (READ_ONCE(g_uids[i]) == uid) { hit = true; break; }
-        if (!hit)
-            return 0;
-    }
-    atomic64_inc(&g_n_rets);
-    head = (READ_ONCE(g_ret_head) + 1) & (64 - 1);
-    WRITE_ONCE(g_ret_head, head);
-    e = &g_ret_ring[head];
-    e->ts = ktime_get_ns();
-    e->cmd = (u32)regs->regs[0];   /* 返回码 x0 */
-    e->uid = uid;
-    e->pid = task_pid_nr(current);
-    memcpy(e->comm, current->comm, TASK_COMM_LEN);
-    return 0;
-}
+/* v3: ag_ret_handler 已整体移除 — 不注册 ret_handler, uretprobe 机制不启用. */
 
 static bool ag_filter(struct uprobe_consumer *self, enum uprobe_filter_ctx ctx,
                       struct mm_struct *mm)
 {
     u32 i, n, uid;
 
-    if (ctx != UPROBE_FILTER_MMAP)
-        return true;    /* register/unregister 由 arm 端进程发起, 放行 */
+    /* v3 修复: REGISTER 上下文不再无条件放行.
+     * 原逻辑 "register/unregister 由 arm 端进程发起, 放行" 在游戏已在跑时
+     * arm 会导致断点插入设备上所有已映射 libtersafe.so 的进程 (微信/QQ 等
+     * 腾讯系全家桶), 爆炸半径过大且是死机嫌疑源.
+     * 新逻辑: 无论何种上下文, 一律按 uid 白名单硬闸. */
     if (!READ_ONCE(g_enable))
         return false;
     n = READ_ONCE(g_uid_count);
@@ -168,7 +143,7 @@ static bool ag_filter(struct uprobe_consumer *self, enum uprobe_filter_ctx ctx,
 
 static struct uprobe_consumer g_uc = {
     .handler     = ag_handler,
-    .ret_handler = ag_ret_handler,
+    /* v3: 不再注册 ret_handler — uretprobe 蹦床机制整条砍掉 */
     .filter      = ag_filter,
 };
 
@@ -223,7 +198,6 @@ static void ag_disarm_locked(void)
 static int ag_show(struct seq_file *m, void *v)
 {
     u32 head = READ_ONCE(g_ring_head);
-    u32 rhead = READ_ONCE(g_ret_head);
     u32 i, n = READ_ONCE(g_uid_count);
 
     seq_printf(m, "mode=%s armed=%d enable=%d\n",
@@ -237,23 +211,14 @@ static int ag_show(struct seq_file *m, void *v)
     seq_printf(m, "uids=%u\n", n);
     for (i = 0; i < n && i < AG_UID_N; i++)
         seq_printf(m, "  uid[%u]=%u\n", i, READ_ONCE(g_uids[i]));
-    seq_printf(m, "calls=%lld skips=%lld rets=%lld\n",
-               atomic64_read(&g_n_calls), atomic64_read(&g_n_skips),
-               atomic64_read(&g_n_rets));
+    seq_printf(m, "calls=%lld skips=%lld\n",
+               atomic64_read(&g_n_calls), atomic64_read(&g_n_skips));
     seq_puts(m, "ring (newest first, last 32):\n");
     for (i = 0; i < 32; i++) {
         u32 idx = (head + AG_RING_N - 1 - i) & (AG_RING_N - 1);
         struct ag_ent *e = &g_ring[idx];
         if (!e->ts) continue;
         seq_printf(m, "  [%3u] %llu cmd=0x%-8x uid=%u pid=%d %s\n",
-                   idx, e->ts, e->cmd, e->uid, e->pid, e->comm);
-    }
-    seq_puts(m, "ret ring (last 8):\n");
-    for (i = 0; i < 8; i++) {
-        u32 idx = (rhead + 64 - 1 - i) & (64 - 1);
-        struct ag_ent *e = &g_ret_ring[idx];
-        if (!e->ts) continue;
-        seq_printf(m, "  [%2u] %llu ret=0x%-8x uid=%u pid=%d %s\n",
                    idx, e->ts, e->cmd, e->uid, e->pid, e->comm);
     }
     return 0;
