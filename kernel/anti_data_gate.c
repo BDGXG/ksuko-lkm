@@ -60,7 +60,6 @@ static u32 g_drop_id;    /* SKIP: 命中即改写的 cmd_id (0=关) */
 static u32 g_remap_id = 0x7FFFFFFF; /* SKIP: 改写目标值 — 不匹配任何分支的哨兵 */
 static u32 g_uids[AG_UID_N];
 static u32 g_uid_count;
-static u32 g_so_uid;
 static DEFINE_MUTEX(g_ctl);
 static bool g_enable;
 static bool g_armed;
@@ -192,7 +191,8 @@ static int ag_arm_locked(void)
         pr_warn(AG_PREFIX "kern_path(%s)=%d\n", g_so_path, ret);
         return ret;
     }
-    g_so_uid = __kuid_val(i_uid_read(g_path.dentry->d_inode));
+    /* i_uid_read() 的返回类型跨内核不统一 (kuid_t/uid_t/vfsuid_t), 只做信息展示,
+     * 不值得为它写兼容层 — so 属主不参与门控, 门控在 handler 的 g_uids 里. */
     ret = uprobe_register(g_path.dentry->d_inode,
                           (loff_t)READ_ONCE(g_probe_off), &g_uc);
     if (ret) {
@@ -202,8 +202,8 @@ static int ag_arm_locked(void)
         return ret;
     }
     g_armed = true;
-    pr_info(AG_PREFIX "armed %s@0x%lx so_uid=%u mode=%s drop=0x%x remap=0x%x\n",
-            g_so_path, READ_ONCE(g_probe_off), g_so_uid,
+    pr_info(AG_PREFIX "armed %s@0x%lx mode=%s drop=0x%x remap=0x%x\n",
+            g_so_path, READ_ONCE(g_probe_off),
             READ_ONCE(g_mode) == AG_SKIP ? "skip" : "log",
             READ_ONCE(g_drop_id), READ_ONCE(g_remap_id));
     return 0;
@@ -230,9 +230,9 @@ static int ag_show(struct seq_file *m, void *v)
     seq_printf(m, "mode=%s armed=%d enable=%d\n",
                READ_ONCE(g_mode) == AG_SKIP ? "skip" : "log",
                g_armed, READ_ONCE(g_enable));
-    seq_printf(m, "path=%s off=0x%lx so_uid=%u\n",
+    seq_printf(m, "path=%s off=0x%lx\n",
                g_so_path ? g_so_path : "(unset)",
-               READ_ONCE(g_probe_off), g_so_uid);
+               READ_ONCE(g_probe_off));
     seq_printf(m, "drop=0x%x remap=0x%x\n",
                READ_ONCE(g_drop_id), READ_ONCE(g_remap_id));
     seq_printf(m, "uids=%u\n", n);
