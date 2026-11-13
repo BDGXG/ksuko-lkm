@@ -295,6 +295,7 @@ static void susfs_layers_down(int upto)
 }
 
 #include "drm_guard.h"
+#include "anti_data_gate.h"
 #include "taint_spoof.h"
 
 static int __init susfs_init(void)
@@ -361,6 +362,11 @@ static int __init susfs_init(void)
     if (drm_guard_init())
         pr_warn("susfs_guard_lkm: drm_guard init failed - DRM spoof stays off\n");
 
+    /* anti_data_gate：tss_sdk_rcv_anti_data 通道拦截（连坐加密抑制, LOG/SKIP 双模式,
+     * uprobe 挂 libtersafe.so TssSDKOnRecvData. 默认 LOG 安全观测, arm 由 proc 触发. */
+    if (anti_data_gate_init())
+        pr_warn("susfs_guard_lkm: anti_data_gate init failed - gate stays off\n");
+
     susfs_self_hide_nodes();
     susfs_relabel_control_nodes();
 
@@ -383,6 +389,7 @@ static void __exit susfs_exit(void)
 {
     susfs_taint_spoof_exit();
     drm_guard_exit();
+    anti_data_gate_exit();
     susfs_layers_down((int)ARRAY_SIZE(susfs_layers) - 1);
     SUSFS_LOGI("susfs_guard_lkm: exit\n");
 }

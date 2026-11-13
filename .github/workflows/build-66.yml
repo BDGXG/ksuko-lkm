@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - drm-m15
+      - hg-kernel
     paths:
       - "kernel/**"
   # Pull requests build the same way, which is what a fork contribution needs: the first fork PR this
