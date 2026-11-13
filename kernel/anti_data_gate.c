@@ -265,31 +265,27 @@ static int ag_open(struct inode *inode, struct file *file)
     return single_open(file, ag_show, NULL);
 }
 
-static ssize_t ag_write(struct file *file, const char __user *ubuf,
-                        size_t count, loff_t *ppos)
+static int ag_exec_line(const char *line)
 {
     char buf[512];
-    size_t len = min_t(size_t, count, sizeof(buf) - 1);
-    int ret = count;
+    size_t len = strnlen(line, sizeof(buf) - 1);
 
-    if (copy_from_user(buf, ubuf, len))
-        return -EFAULT;
+    if (!len)
+        return -EINVAL;
+    memcpy(buf, line, len);
     buf[len] = 0;
-    while (len && (buf[len-1] == '\n' || buf[len-1] == '\r'))
-        buf[--len] = 0;
 
-    mutex_lock(&g_ctl);
     if (!strncmp(buf, "mode log", 8)) {
         WRITE_ONCE(g_mode, AG_LOG);
     } else if (!strncmp(buf, "mode skip", 9)) {
         WRITE_ONCE(g_mode, AG_SKIP);
     } else if (!strncmp(buf, "drop ", 5)) {
         u32 v;
-        if (kstrtouint(buf + 5, 0, &v)) { mutex_unlock(&g_ctl); return -EINVAL; }
+        if (kstrtouint(buf + 5, 0, &v)) return -EINVAL;
         WRITE_ONCE(g_drop_id, v);
     } else if (!strncmp(buf, "remap ", 6)) {
         u32 v;
-        if (kstrtouint(buf + 6, 0, &v)) { mutex_unlock(&g_ctl); return -EINVAL; }
+        if (kstrtouint(buf + 6, 0, &v)) return -EINVAL;
         WRITE_ONCE(g_remap_id, v);
     } else if (!strncmp(buf, "uids ", 5)) {
         char *p = buf + 5, *tok;
@@ -305,27 +301,43 @@ static ssize_t ag_write(struct file *file, const char __user *ubuf,
     } else if (!strncmp(buf, "path ", 5)) {
         kfree(g_so_path);
         g_so_path = kstrdup(buf + 5, GFP_KERNEL);
-        if (!g_so_path) { mutex_unlock(&g_ctl); return -ENOMEM; }
+        if (!g_so_path) return -ENOMEM;
     } else if (!strncmp(buf, "off ", 4)) {
         unsigned long v;
-        if (kstrtoul(buf + 4, 0, &v)) { mutex_unlock(&g_ctl); return -EINVAL; }
+        if (kstrtoul(buf + 4, 0, &v)) return -EINVAL;
         WRITE_ONCE(g_probe_off, v);
     } else if (!strncmp(buf, "enable ", 7)) {
         u32 v;
-        if (kstrtouint(buf + 7, 0, &v)) { mutex_unlock(&g_ctl); return -EINVAL; }
+        if (kstrtouint(buf + 7, 0, &v)) return -EINVAL;
         WRITE_ONCE(g_enable, v ? 1 : 0);
     } else if (!strncmp(buf, "arm", 3) &&
                (buf[3] == 0 || buf[3] == '\n' || buf[3] == ' ')) {
-        ret = ag_arm_locked();
-        if (ret) { mutex_unlock(&g_ctl); return ret; }
+        return ag_arm_locked();
     } else if (!strncmp(buf, "disarm", 6)) {
         ag_disarm_locked();
     } else {
-        mutex_unlock(&g_ctl);
         return -EINVAL;
     }
+    return 0;
+}
+
+static ssize_t ag_write(struct file *file, const char __user *ubuf,
+                        size_t count, loff_t *ppos)
+{
+    char buf[512];
+    size_t len = min_t(size_t, count, sizeof(buf) - 1);
+    int ret;
+
+    if (copy_from_user(buf, ubuf, len))
+        return -EFAULT;
+    buf[len] = 0;
+    while (len && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = 0;
+
+    mutex_lock(&g_ctl);
+    ret = ag_exec_line(buf);
     mutex_unlock(&g_ctl);
-    return ret;
+    return ret ? ret : count;
 }
 
 static const struct proc_ops ag_proc_ops = {
@@ -339,11 +351,68 @@ static const struct proc_ops ag_proc_ops = {
 static struct proc_dir_entry *g_proc;
 
 /* ---- init/exit ---- */
+/* 模块加载时自动读取 /sdcard/Download/hg_antidata.conf：逐行按 proc 相同语法执行。
+ * 目的：全链路自动化，无需任何手动 root 命令（proc 节点被 sus_path 隐藏层保护，
+ * 无 root 无法访问；Root/Shizuku 通道不可靠）。文件不存在 = 保持默认 LOG 不 arm。 */
+static void ag_boot_conf(void)
+{
+    struct file *f;
+    char buf[512];
+    char carry[512];
+    size_t carry_len = 0;
+    loff_t pos = 0;
+    int n;
+
+    mutex_lock(&g_ctl);
+    f = filp_open("/sdcard/Download/hg_antidata.conf", O_RDONLY, 0);
+    if (IS_ERR(f)) {
+        mutex_unlock(&g_ctl);
+        pr_info(AG_PREFIX "no boot conf, staying LOG\n");
+        return;
+    }
+    while ((n = kernel_read(f, buf, sizeof(buf) - 1, &pos)) > 0) {
+        char *line, *p;
+        size_t keep = 0;
+        buf[n] = 0;
+        /* 拼接上一轮未完成的半行 */
+        if (carry_len) {
+            if (carry_len + n >= sizeof(buf)) carry_len = 0; /* 太长丢弃 */
+            else { memmove(buf + carry_len, buf, n + 1); memcpy(buf, carry, carry_len); }
+        }
+        p = buf;
+        while ((line = strsep(&p, "\n")) != NULL) {
+            if (p == NULL && strlen(line)) {   /* 末行未带换行: 可能跨读, 存 carry */
+                strncpy(carry, line, sizeof(carry) - 1);
+                carry[sizeof(carry) - 1] = 0;
+                keep = strlen(carry);
+                continue;
+            }
+            {
+                size_t ll = strlen(line);
+                while (ll && (line[ll-1] == '\r' || line[ll-1] == ' ')) line[--ll] = 0;
+                if (!ll) continue;
+                ag_exec_line(line);
+            }
+        }
+        carry_len = keep;
+        (void)carry_len;
+    }
+    /* 文件末行(无换行)也执行 */
+    if (carry_len) {
+        carry[carry_len] = 0;
+        ag_exec_line(carry);
+    }
+    filp_close(f, NULL);
+    mutex_unlock(&g_ctl);
+    pr_info(AG_PREFIX "boot conf applied\n");
+}
+
 int anti_data_gate_init(void)
 {
     g_proc = proc_create("susfs_anti_data_gate", 0644, NULL, &ag_proc_ops);
     if (!g_proc)
         return -ENOMEM;
+    ag_boot_conf();
     pr_info(AG_PREFIX "init: LOG 模式 (安全观测)\n");
     return 0;
 }
