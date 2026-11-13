@@ -73,7 +73,6 @@ struct ag_ent {
 };
 static struct ag_ent g_ring[AG_RING_N];
 static u32 g_ring_head;
-static atomic64_t g_n_calls, g_n_skips, g_n_filtered;
 static struct ag_ent g_ret_ring[64];
 static u32 g_ret_head;
 static atomic64_t g_n_rets;
